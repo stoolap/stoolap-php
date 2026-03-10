@@ -1,0 +1,35 @@
+ARG_WITH("stoolap", "for stoolap support", "no");
+
+if (PHP_STOOLAP != "no") {
+    var stoolap_lib_dir = "";
+
+    if (PHP_STOOLAP != "yes") {
+        // User specified directory
+        if (FSO.FileExists(PHP_STOOLAP + "\\stoolap.lib")) {
+            stoolap_lib_dir = PHP_STOOLAP;
+        } else if (FSO.FileExists(PHP_STOOLAP + "\\lib\\stoolap.lib")) {
+            stoolap_lib_dir = PHP_STOOLAP + "\\lib";
+        }
+    }
+
+    // Auto-detect in common locations
+    if (stoolap_lib_dir == "") {
+        var search_dirs = [
+            configure_module_dirname + "\\..",
+            PHP_PHP_BUILD + "\\lib"
+        ];
+        for (var i = 0; i < search_dirs.length; i++) {
+            if (FSO.FileExists(search_dirs[i] + "\\stoolap.lib")) {
+                stoolap_lib_dir = search_dirs[i];
+                break;
+            }
+        }
+    }
+
+    if (stoolap_lib_dir == "") {
+        ERROR("stoolap library not found. Use --with-stoolap=DIR to specify location");
+    }
+
+    CHECK_LIB("stoolap.lib", "stoolap", stoolap_lib_dir);
+    EXTENSION("stoolap", "stoolap.c", PHP_STOOLAP_SHARED, "");
+}

@@ -1,0 +1,33 @@
+/vendor/
+composer.lock
+composer.phar
+.phpunit.result.cache
+
+# Binary libraries
+*.dylib
+*.so
+*.dll
+*.lib
+
+# PHP extension build artifacts
+ext/autom4te.cache/
+ext/build/
+ext/modules/
+ext/.libs/
+ext/configure
+ext/configure.ac
+ext/config.h
+ext/config.h.in
+ext/config.log
+ext/config.nice
+ext/config.status
+ext/libtool
+ext/Makefile
+ext/Makefile.frag
+ext/Makefile.fragments
+ext/Makefile.objects
+ext/run-tests.php
+ext/*.lo
+ext/*.la
+ext/*.o
+ext/*.dep

@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags-ignore: ['**']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  STOOLAP_VERSION: v0.3.4
+
+jobs:
+  build-lib:
+    name: Build libstoolap - ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            lib: libstoolap.so
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            lib: libstoolap.dylib
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            lib: stoolap.dll
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Clone stoolap engine
+        run: git clone --depth 1 --branch ${{ env.STOOLAP_VERSION }} https://github.com/stoolap/stoolap.git stoolap-engine
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            stoolap-engine/target
+            ~/.cargo/registry
+          key: rust-${{ matrix.target }}-${{ env.STOOLAP_VERSION }}
+
+      - name: Build libstoolap
+        working-directory: stoolap-engine
+        run: cargo build --release --features ffi
+
+      - name: Upload library
+        uses: actions/upload-artifact@v4
+        with:
+          name: lib-${{ matrix.target }}
+          path: stoolap-engine/target/release/${{ matrix.lib }}
+          if-no-files-found: error
+
+  test:
+    name: Test - PHP ${{ matrix.php }} (${{ matrix.os }})
+    needs: build-lib
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        php: ['8.1', '8.2', '8.3', '8.4']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine library artifact
+        id: lib
+        shell: bash
+        run: |
+          if [[ "${{ matrix.os }}" == "macos-latest" ]]; then
+            echo "name=lib-aarch64-apple-darwin" >> $GITHUB_OUTPUT
+            echo "file=libstoolap.dylib" >> $GITHUB_OUTPUT
+          else
+            echo "name=lib-x86_64-unknown-linux-gnu" >> $GITHUB_OUTPUT
+            echo "file=libstoolap.so" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download libstoolap
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.lib.outputs.name }}
+          path: .
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+
+      - name: Build extension
+        run: |
+          cd ext
+          phpize
+          ./configure --with-stoolap=${{ github.workspace }}
+          make
+
+      - name: Install dependencies
+        run: composer install --no-interaction
+
+      - name: Run tests
+        shell: bash
+        run: |
+          if [[ "${{ matrix.os }}" == "macos-latest" ]]; then
+            export DYLD_LIBRARY_PATH=${{ github.workspace }}:${DYLD_LIBRARY_PATH:-}
+          else
+            export LD_LIBRARY_PATH=${{ github.workspace }}:${LD_LIBRARY_PATH:-}
+          fi
+          php -d extension=ext/modules/stoolap.so vendor/bin/phpunit --testdox

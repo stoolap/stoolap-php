@@ -1,0 +1,150 @@
+name: Publish
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  STOOLAP_VERSION: v0.3.4
+
+jobs:
+  build-lib:
+    name: Build libstoolap - ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            lib: libstoolap.so
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            lib: libstoolap.dylib
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Clone stoolap engine
+        run: git clone --depth 1 --branch ${{ env.STOOLAP_VERSION }} https://github.com/stoolap/stoolap.git stoolap-engine
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            stoolap-engine/target
+            ~/.cargo/registry
+          key: rust-${{ matrix.target }}-${{ env.STOOLAP_VERSION }}
+
+      - name: Build libstoolap
+        working-directory: stoolap-engine
+        run: cargo build --release --features ffi
+
+      - name: Upload library
+        uses: actions/upload-artifact@v4
+        with:
+          name: lib-${{ matrix.target }}
+          path: stoolap-engine/target/release/${{ matrix.lib }}
+          if-no-files-found: error
+
+  build-ext:
+    name: Build - PHP ${{ matrix.php }} (${{ matrix.platform }}-${{ matrix.arch }})
+    needs: build-lib
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        php: ['8.1', '8.2', '8.3', '8.4']
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            lib: libstoolap.so
+            platform: linux
+            arch: x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            lib: libstoolap.dylib
+            platform: darwin
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download libstoolap
+        uses: actions/download-artifact@v4
+        with:
+          name: lib-${{ matrix.target }}
+          path: lib
+
+      - name: Install libstoolap to /usr/local/lib
+        shell: bash
+        run: |
+          sudo mkdir -p /usr/local/lib
+          sudo cp lib/${{ matrix.lib }} /usr/local/lib/
+          if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
+            sudo ldconfig
+          fi
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+
+      - name: Build extension
+        run: |
+          cd ext
+          phpize
+          ./configure --with-stoolap=/usr/local/lib
+          make
+
+      - name: Install dependencies
+        run: composer install --no-interaction
+
+      - name: Run tests
+        shell: bash
+        run: |
+          if [[ "${{ matrix.os }}" == "macos-latest" ]]; then
+            export DYLD_LIBRARY_PATH=/usr/local/lib:${DYLD_LIBRARY_PATH:-}
+          else
+            export LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}
+          fi
+          php -d extension=ext/modules/stoolap.so vendor/bin/phpunit --testdox
+
+      - name: Package
+        shell: bash
+        run: |
+          DIST_DIR="stoolap-${{ github.ref_name }}-php${{ matrix.php }}-${{ matrix.platform }}-${{ matrix.arch }}"
+          mkdir -p "$DIST_DIR"
+          cp ext/modules/stoolap.so "$DIST_DIR/"
+          cp lib/${{ matrix.lib }} "$DIST_DIR/"
+          tar czf "${DIST_DIR}.tar.gz" "$DIST_DIR"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: stoolap-php${{ matrix.php }}-${{ matrix.platform }}-${{ matrix.arch }}
+          path: "*.tar.gz"
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build-ext
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all packages
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: stoolap-*
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
+          generate_release_notes: true
