@@ -8,7 +8,7 @@ permissions:
   contents: write
 
 env:
-  STOOLAP_VERSION: v0.3.4
+  STOOLAP_VERSION: main
 
 jobs:
   build-lib:
@@ -37,7 +37,7 @@ jobs:
           path: |
             stoolap-engine/target
             ~/.cargo/registry
-          key: rust-${{ matrix.target }}-${{ env.STOOLAP_VERSION }}
+          key: rust-${{ matrix.target }}-${{ github.sha }}
 
       - name: Build libstoolap
         working-directory: stoolap-engine
