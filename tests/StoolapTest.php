@@ -527,9 +527,9 @@ class StoolapTest extends TestCase
         $rows = $this->db->query(
             "SELECT id, CASE WHEN val < 30 THEN 'low' WHEN val < 70 THEN 'mid' ELSE 'high' END as level FROM t ORDER BY id"
         );
-        $this->assertSame('low', $rows[0]['LEVEL']);
-        $this->assertSame('mid', $rows[1]['LEVEL']);
-        $this->assertSame('high', $rows[2]['LEVEL']);
+        $this->assertSame('low', $rows[0]['level']);
+        $this->assertSame('mid', $rows[1]['level']);
+        $this->assertSame('high', $rows[2]['level']);
     }
 
     // ---- Error handling ----
