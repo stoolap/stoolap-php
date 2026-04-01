@@ -4,7 +4,7 @@
 extern zend_module_entry stoolap_module_entry;
 #define phpext_stoolap_ptr &stoolap_module_entry
 
-#define PHP_STOOLAP_VERSION "0.3.7"
+#define PHP_STOOLAP_VERSION "0.4.0"
 
 /* Stoolap C API types */
 typedef struct StoolapDB StoolapDB;

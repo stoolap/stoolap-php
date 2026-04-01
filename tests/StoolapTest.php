@@ -805,6 +805,30 @@ class StoolapTest extends TestCase
 
     // ---- File-based persistence ----
 
+    /**
+     * Recursively remove a directory and all its contents.
+     * Handles the deep directory structure of v0.4.0 volumes (volumes/table/files).
+     */
+    private static function removeDir(string $dir): void
+    {
+        if (!is_dir($dir)) {
+            return;
+        }
+        $items = scandir($dir);
+        foreach ($items as $item) {
+            if ($item === '.' || $item === '..') {
+                continue;
+            }
+            $path = $dir . '/' . $item;
+            if (is_dir($path)) {
+                self::removeDir($path);
+            } else {
+                @unlink($path);
+            }
+        }
+        @rmdir($dir);
+    }
+
     public function testFilePersistence(): void
     {
         $tmpDir = sys_get_temp_dir() . '/stoolap_php_test_' . getmypid();
@@ -824,23 +848,131 @@ class StoolapTest extends TestCase
             $this->assertSame('world', $rows[1]['val']);
             $db->close();
         } finally {
-            $files = glob($tmpDir . '/*');
-            if ($files) {
-                foreach ($files as $f) {
-                    if (is_dir($f)) {
-                        $sub = glob($f . '/*');
-                        if ($sub) {
-                            foreach ($sub as $sf) {
-                                @unlink($sf);
-                            }
-                        }
-                        @rmdir($f);
-                    } else {
-                        @unlink($f);
-                    }
-                }
-            }
-            @rmdir($tmpDir);
+            self::removeDir($tmpDir);
+        }
+    }
+
+    public function testPersistMultipleTablesAndTypes(): void
+    {
+        $tmpDir = sys_get_temp_dir() . '/stoolap_php_persist_types_' . getmypid();
+        @mkdir($tmpDir, 0755, true);
+        $dsn = 'file://' . $tmpDir . '/testdb';
+
+        try {
+            $db = Database::open($dsn);
+            $db->exec('CREATE TABLE kv (id INTEGER PRIMARY KEY, k TEXT, v TEXT)');
+            $db->exec('CREATE TABLE nums (id INTEGER PRIMARY KEY, val FLOAT, active BOOLEAN)');
+            $db->execute('INSERT INTO kv VALUES ($1, $2, $3)', [1, 'greeting', 'hello']);
+            $db->execute('INSERT INTO kv VALUES ($1, $2, $3)', [2, 'farewell', 'goodbye']);
+            $db->execute('INSERT INTO nums VALUES ($1, $2, $3)', [1, 3.14, true]);
+            $db->execute('INSERT INTO nums VALUES ($1, $2, $3)', [2, 2.71, false]);
+            $db->close();
+
+            // Reopen and verify
+            $db = Database::open($dsn);
+            $kv = $db->query('SELECT * FROM kv ORDER BY k');
+            $this->assertCount(2, $kv);
+            $this->assertSame('farewell', $kv[0]['k']);
+            $this->assertSame('goodbye', $kv[0]['v']);
+            $this->assertSame('greeting', $kv[1]['k']);
+            $this->assertSame('hello', $kv[1]['v']);
+
+            $nums = $db->query('SELECT * FROM nums ORDER BY id');
+            $this->assertCount(2, $nums);
+            $this->assertEqualsWithDelta(3.14, $nums[0]['val'], 0.01);
+            $this->assertTrue($nums[0]['active']);
+            $this->assertFalse($nums[1]['active']);
+            $db->close();
+        } finally {
+            self::removeDir($tmpDir);
+        }
+    }
+
+    public function testPersistAfterBatchInsert(): void
+    {
+        $tmpDir = sys_get_temp_dir() . '/stoolap_php_batch_persist_' . getmypid();
+        @mkdir($tmpDir, 0755, true);
+        $dsn = 'file://' . $tmpDir . '/testdb';
+
+        try {
+            $db = Database::open($dsn);
+            $db->exec('CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)');
+            $db->executeBatch('INSERT INTO items VALUES ($1, $2)', [
+                [1, 'alpha'],
+                [2, 'beta'],
+                [3, 'gamma'],
+            ]);
+            $db->close();
+
+            $db = Database::open($dsn);
+            $rows = $db->query('SELECT * FROM items ORDER BY id');
+            $this->assertCount(3, $rows);
+            $this->assertSame('alpha', $rows[0]['name']);
+            $this->assertSame('gamma', $rows[2]['name']);
+            $db->close();
+        } finally {
+            self::removeDir($tmpDir);
+        }
+    }
+
+    public function testVolumesDirectoryCreatedOnCheckpoint(): void
+    {
+        $tmpDir = sys_get_temp_dir() . '/stoolap_php_vol_' . getmypid();
+        @mkdir($tmpDir, 0755, true);
+        $dbPath = $tmpDir . '/testdb';
+        $dsn = 'file://' . $dbPath;
+
+        try {
+            $db = Database::open($dsn);
+            $db->exec('CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)');
+            $db->execute('INSERT INTO t VALUES ($1, $2)', [1, 'test']);
+            $db->exec('PRAGMA CHECKPOINT');
+            $db->close();
+
+            // v0.4.0: volumes/ should exist, snapshots/ should not
+            $this->assertDirectoryExists($dbPath . '/volumes');
+            $this->assertDirectoryDoesNotExist($dbPath . '/snapshots');
+
+            // Verify data survived
+            $db = Database::open($dsn);
+            $row = $db->queryOne('SELECT * FROM t WHERE id = $1', [1]);
+            $this->assertSame('test', $row['val']);
+            $db->close();
+        } finally {
+            self::removeDir($tmpDir);
+        }
+    }
+
+    public function testPersistTransactionCommitButNotRollback(): void
+    {
+        $tmpDir = sys_get_temp_dir() . '/stoolap_php_tx_persist_' . getmypid();
+        @mkdir($tmpDir, 0755, true);
+        $dsn = 'file://' . $tmpDir . '/testdb';
+
+        try {
+            $db = Database::open($dsn);
+            $db->exec('CREATE TABLE txp (id INTEGER PRIMARY KEY, val TEXT)');
+
+            // Committed transaction
+            $tx = $db->begin();
+            $tx->execute('INSERT INTO txp VALUES ($1, $2)', [1, 'kept']);
+            $tx->commit();
+
+            // Rolled back transaction
+            $tx = $db->begin();
+            $tx->execute('INSERT INTO txp VALUES ($1, $2)', [2, 'discarded']);
+            $tx->rollback();
+
+            $db->close();
+
+            // Verify only committed data persisted
+            $db = Database::open($dsn);
+            $rows = $db->query('SELECT * FROM txp ORDER BY id');
+            $this->assertCount(1, $rows);
+            $this->assertSame('kept', $rows[0]['val']);
+            $db->close();
+        } finally {
+            self::removeDir($tmpDir);
         }
     }
 

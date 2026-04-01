@@ -15,8 +15,8 @@ Built as a native PHP extension (C) for minimal overhead.
 Download a package matching your PHP version and platform from [GitHub Releases](https://github.com/stoolap/stoolap-php/releases). Each archive contains both the PHP extension and the stoolap library.
 
 ```bash
-tar xzf stoolap-v0.3.7-php8.4-linux-x86_64.tar.gz
-cd stoolap-v0.3.7-php8.4-linux-x86_64
+tar xzf stoolap-v0.4.0-php8.4-linux-x86_64.tar.gz
+cd stoolap-v0.4.0-php8.4-linux-x86_64
 
 # Install the shared library
 sudo cp libstoolap.so /usr/local/lib/
@@ -166,7 +166,7 @@ On error, all changes are rolled back (atomic). Also available on transactions v
 
 #### Persistence
 
-File-based databases persist data to disk. Data survives process restarts.
+File-based databases persist data to disk using WAL (Write-Ahead Logging) and an immutable volume-based storage engine. Hot data lives in a mutable buffer, cold data is sealed into columnar `.vol` files with zone maps, bloom filters, dictionary encoding, and LZ4 compression. Compressed blocks are loaded into RAM at startup; columns are decompressed on first access. Data survives process restarts.
 
 ```php
 $db = Database::open('./mydata');
@@ -181,6 +181,50 @@ $row = $db2->queryOne('SELECT * FROM kv WHERE key = $1', ['hello']);
 // ['key' => 'hello', 'value' => 'world']
 $db2->close();
 ```
+
+##### Configuration
+
+Pass configuration as query parameters in the path:
+
+```php
+// Maximum durability: fsync on every write
+$db = Database::open('./mydata?sync_mode=full');
+
+// High throughput: no fsync, data durable at checkpoint
+$db = Database::open('./mydata?sync_mode=none');
+
+// Custom checkpoint interval with compression
+$db = Database::open('./mydata?checkpoint_interval=60&compression=on');
+
+// Multiple options
+$db = Database::open(
+    './mydata?sync_mode=normal&checkpoint_interval=120&compact_threshold=4'
+);
+```
+
+##### Sync Modes
+
+Controls the durability vs. performance trade-off:
+
+| Mode | Value | Description |
+|------|-------|-------------|
+| `none` | `sync_mode=none` | No fsync. Data durable only after checkpoint |
+| `normal` | `sync_mode=normal` | Fsync every 1 second (batched). DDL fsyncs immediately (default) |
+| `full` | `sync_mode=full` | Fsync on every write. Maximum durability |
+
+##### All Configuration Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `sync_mode` | `normal` | Sync mode: `none`, `normal`, or `full` |
+| `checkpoint_interval` | `60` | Seconds between checkpoint cycles (seal + compact + WAL truncate) |
+| `compact_threshold` | `4` | Sub-target volumes per table before merging |
+| `target_volume_rows` | `1048576` | Target rows per cold volume. Controls compaction split boundary |
+| `checkpoint_on_close` | `on` | Seal all hot rows on clean shutdown for fast startup |
+| `wal_compression` | `on` | LZ4 compression for WAL entries |
+| `volume_compression` | `on` | LZ4 compression for cold volume files |
+| `compression` | `on` | Shorthand: set both `wal_compression` and `volume_compression` |
+| `keep_snapshots` | `5` | Number of backup snapshot files to retain |
 
 #### Raw Query Format
 
