@@ -359,6 +359,41 @@ try {
 | `array` / `object` | `JSON` | Auto-encoded/decoded |
 | `DateTimeInterface` | `TIMESTAMP` | Converted to nanoseconds |
 
+## PHP-FPM / Web Server Support
+
+Stoolap uses exclusive file locking, so only one OS process can open a database at a time. The PHP extension solves this transparently for multi-process environments (php-fpm, Apache mod_php) with a built-in daemon proxy.
+
+### How It Works
+
+When loaded under php-fpm, CGI, or Apache, the extension automatically forks a background daemon process on first load. PHP workers communicate with the daemon via shared memory + futex/ulock for near-zero IPC overhead:
+
+- **Shared memory**: 8MB per connection, zero-copy request/response buffers
+- **futex (Linux) / __ulock (macOS)**: single-syscall wakeup, ~0.5μs bare roundtrip
+- **Spin-then-wait**: fast spin phase catches sub-microsecond responses, kernel wait for longer queries without CPU burn
+- **Auto-lifecycle**: daemon starts with php-fpm, exits when php-fpm stops
+- **Zero configuration**: works out of the box, no setup required
+
+### IPC Overhead
+
+| Operation | Direct (CLI) | Daemon (FPM) | Overhead |
+|---|---|---|---|
+| SELECT by PK | 0.5 μs | 1.0 μs | ~0.5 μs |
+| UPDATE by PK | 0.8 μs | 1.2 μs | ~0.5 μs |
+| Prepared execute | 0.6 μs | 1.1 μs | ~0.5 μs |
+| Prepared queryOne | 1.1 μs | 1.7 μs | ~0.6 μs |
+
+Analytical queries (GROUP BY, JOIN, window functions) are unaffected since they're dominated by engine time.
+
+### Environment Variables
+
+| Variable | Values | Description |
+|---|---|---|
+| `STOOLAP_DAEMON` | `1` / `on` | Force daemon mode (useful for testing) |
+| `STOOLAP_DAEMON` | `0` / `off` | Force direct mode (disable daemon) |
+| `STOOLAP_DAEMON_DEBUG` | `1` | Enable daemon stderr logging |
+
+When not set, daemon mode is auto-detected from the SAPI name (fpm, cgi, apache).
+
 ## Benchmark
 
 Run the included benchmark (Stoolap vs SQLite):

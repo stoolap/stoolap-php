@@ -15,6 +15,16 @@
 
 #include "ext/spl/spl_exceptions.h"
 #include "php_stoolap.h"
+#include "SAPI.h"
+#include "stoolap_daemon.h"
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/mman.h>
+#include <sys/file.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <sched.h>
+#include <sys/wait.h>
 
 /* ================================================================
  * Class entries and object handlers
@@ -31,12 +41,25 @@ static zend_object_handlers stoolap_transaction_handlers;
 
 static zend_class_entry *datetime_interface_ce;
 
+static inline zend_class_entry *get_datetime_ce(void) {
+    if (!datetime_interface_ce) {
+        zend_string *name = zend_string_init("DateTimeInterface", sizeof("DateTimeInterface") - 1, 0);
+        datetime_interface_ce = zend_lookup_class(name);
+        zend_string_release(name);
+    }
+    return datetime_interface_ce;
+}
+
 /* ================================================================
  * Object structs
  * ================================================================ */
 
 typedef struct {
-    StoolapDB *db;
+    StoolapDB *db;           /* NULL when proxied */
+    int proxy_fd;             /* Unix socket fd, -1 = direct */
+    void *shm_base;           /* mmap'd shared memory, NULL = direct */
+    char shm_name[32];        /* for shm_unlink */
+    char dsn[256];            /* stored DSN for clone support */
     zend_object std;
 } stoolap_db_obj;
 
@@ -47,6 +70,7 @@ typedef struct {
     uint32_t param_name_count;
     StoolapValue *cached_values;
     int32_t cached_count;
+    uint32_t proxy_stmt_id;
     zval db_zv;     /* strong reference to Database object — prevents GC */
     zend_object std;
 } stoolap_stmt_obj;
@@ -54,6 +78,7 @@ typedef struct {
 typedef struct {
     StoolapTx *tx;
     StoolapDB *db;
+    uint32_t proxy_tx_id;
     zval db_zv;     /* strong reference to Database object — prevents GC */
     zend_object std;
 } stoolap_tx_obj;
@@ -73,6 +98,9 @@ static inline stoolap_tx_obj *stoolap_tx_from_obj(zend_object *obj) {
 #define Z_STOOLAP_STMT_P(zv) stoolap_stmt_from_obj(Z_OBJ_P(zv))
 #define Z_STOOLAP_TX_P(zv) stoolap_tx_from_obj(Z_OBJ_P(zv))
 
+#define PROXY_ACTIVE(obj) ((obj)->proxy_fd >= 0)
+#define DB_IS_OPEN(obj)   ((obj)->db != NULL || PROXY_ACTIVE(obj))
+
 /* ================================================================
  * Buffer reading helpers (little-endian)
  * ================================================================ */
@@ -81,12 +109,6 @@ static inline uint16_t buf_u16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2);
 static inline uint32_t buf_u32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 static inline int64_t  buf_i64(const uint8_t *p) { int64_t  v; memcpy(&v, p, 8); return v; }
 static inline double   buf_f64(const uint8_t *p) { double   v; memcpy(&v, p, 8); return v; }
-
-/* Column name reference into buffer (avoids zend_string alloc per query) */
-typedef struct {
-    const char *ptr;
-    uint16_t len;
-} col_ref_t;
 
 /* Decode a JSON value from the buffer. Uses stack buffer for small JSON,
  * heap for large. php_json_decode_ex requires null-terminated input. */
@@ -161,62 +183,46 @@ static int datetime_to_nanos(zval *dt_obj, int64_t *out_nanos)
     return 0;
 }
 
-/* Parse one row from buffer into an assoc array using col_ref_t names */
-static inline void parse_one_row_assoc(const uint8_t *buf, size_t *off,
-    const col_ref_t *cols, uint32_t col_count, zval *row)
+/* Parse one row from buffer into an assoc array using pre-hashed zend_string names */
+static inline void parse_one_row_hashed(const uint8_t *buf, size_t *off,
+    zend_string **col_strs, uint32_t col_count, zval *row)
 {
     array_init_size(row, col_count);
     for (uint32_t c = 0; c < col_count; c++) {
         uint8_t type = buf[(*off)++];
+        zval tmp;
         switch (type) {
-            case 0:
-                add_assoc_null_ex(row, cols[c].ptr, cols[c].len);
-                break;
-            case 1: {
-                int64_t v = buf_i64(buf + *off); *off += 8;
-                add_assoc_long_ex(row, cols[c].ptr, cols[c].len, (zend_long)v);
-                break;
-            }
-            case 2: {
-                double v = buf_f64(buf + *off); *off += 8;
-                add_assoc_double_ex(row, cols[c].ptr, cols[c].len, v);
-                break;
-            }
+            case 0: ZVAL_NULL(&tmp); break;
+            case 1: { int64_t v = buf_i64(buf + *off); *off += 8; ZVAL_LONG(&tmp, (zend_long)v); break; }
+            case 2: { double v = buf_f64(buf + *off); *off += 8; ZVAL_DOUBLE(&tmp, v); break; }
             case 3: {
                 uint32_t len = buf_u32(buf + *off); *off += 4;
-                add_assoc_stringl_ex(row, cols[c].ptr, cols[c].len,
-                                     (const char *)(buf + *off), len);
+                ZVAL_STRINGL(&tmp, (const char *)(buf + *off), len);
                 *off += len;
                 break;
             }
-            case 4: {
-                uint8_t v = buf[(*off)++];
-                add_assoc_bool_ex(row, cols[c].ptr, cols[c].len, v != 0);
-                break;
-            }
+            case 4: { uint8_t v = buf[(*off)++]; ZVAL_BOOL(&tmp, v != 0); break; }
             case 5: {
                 int64_t nanos = buf_i64(buf + *off); *off += 8;
                 char tsbuf[64];
                 int tslen = format_timestamp(nanos, tsbuf, sizeof(tsbuf));
-                add_assoc_stringl_ex(row, cols[c].ptr, cols[c].len, tsbuf, tslen);
+                ZVAL_STRINGL(&tmp, tsbuf, tslen);
                 break;
             }
             case 6: {
                 uint32_t len = buf_u32(buf + *off); *off += 4;
-                zval decoded;
-                decode_json_value(buf + *off, len, &decoded);
+                decode_json_value(buf + *off, len, &tmp);
                 *off += len;
-                add_assoc_zval_ex(row, cols[c].ptr, cols[c].len, &decoded);
                 break;
             }
             case 7: {
                 uint32_t len = buf_u32(buf + *off); *off += 4;
-                add_assoc_stringl_ex(row, cols[c].ptr, cols[c].len,
-                                     (const char *)(buf + *off), len);
+                ZVAL_STRINGL(&tmp, (const char *)(buf + *off), len);
                 *off += len;
                 break;
             }
         }
+        zend_symtable_update(Z_ARRVAL_P(row), col_strs[c], &tmp);
     }
 }
 
@@ -319,14 +325,14 @@ static void parse_buffer_one(const uint8_t *buf, size_t buf_len, zval *return_va
     size_t off = 0;
     uint32_t col_count = buf_u32(buf + off); off += 4;
 
-    /* Stack-allocate column refs for typical queries (≤32 columns) */
-    col_ref_t stack_cols[32];
-    col_ref_t *cols = (col_count <= 32) ? stack_cols
-                                        : emalloc(sizeof(col_ref_t) * col_count);
+    /* Build pre-hashed zend_string column names (stack for ≤32 columns) */
+    zend_string *stack_strs[32];
+    zend_string **col_strs = (col_count <= 32) ? stack_strs
+                                               : emalloc(sizeof(zend_string *) * col_count);
     for (uint32_t i = 0; i < col_count; i++) {
-        cols[i].len = buf_u16(buf + off); off += 2;
-        cols[i].ptr = (const char *)(buf + off);
-        off += cols[i].len;
+        uint16_t name_len = buf_u16(buf + off); off += 2;
+        col_strs[i] = zend_string_init((const char *)(buf + off), name_len, 0);
+        off += name_len;
     }
 
     uint32_t row_count = buf_u32(buf + off); off += 4;
@@ -334,10 +340,13 @@ static void parse_buffer_one(const uint8_t *buf, size_t buf_len, zval *return_va
     if (row_count == 0) {
         ZVAL_NULL(return_value);
     } else {
-        parse_one_row_assoc(buf, &off, cols, col_count, return_value);
+        parse_one_row_hashed(buf, &off, col_strs, col_count, return_value);
     }
 
-    if (cols != stack_cols) efree(cols);
+    for (uint32_t i = 0; i < col_count; i++) {
+        zend_string_release(col_strs[i]);
+    }
+    if (col_strs != stack_strs) efree(col_strs);
 }
 
 /* ================================================================
@@ -576,6 +585,84 @@ static char *strip_semicolon(const char *sql, size_t sql_len, size_t *out_len)
 }
 
 /* ================================================================
+ * Single-value param fill helper (shared by all param-build paths)
+ *
+ * Fills one StoolapValue from a zval. If the value is JSON-encoded
+ * (array/object), the resulting zend_string is tracked in json_strs
+ * for later cleanup. Returns SUCCESS or FAILURE (exception set).
+ * ================================================================ */
+
+static inline int fill_one_param(zval *val, StoolapValue *out,
+    zend_string ***json_strs, int *json_count, int *json_alloc)
+{
+    out->_padding = 0;
+
+    switch (Z_TYPE_P(val)) {
+    case IS_NULL:
+        out->value_type = 0;
+        return SUCCESS;
+    case IS_TRUE:
+        out->value_type = 4;
+        out->v.boolean = 1;
+        return SUCCESS;
+    case IS_FALSE:
+        out->value_type = 4;
+        out->v.boolean = 0;
+        return SUCCESS;
+    case IS_LONG:
+        out->value_type = 1;
+        out->v.integer = Z_LVAL_P(val);
+        return SUCCESS;
+    case IS_DOUBLE:
+        out->value_type = 2;
+        out->v.float64 = Z_DVAL_P(val);
+        return SUCCESS;
+    case IS_STRING:
+        out->value_type = 3;
+        out->v.text.ptr = Z_STRVAL_P(val);
+        out->v.text.len = Z_STRLEN_P(val);
+        return SUCCESS;
+    case IS_ARRAY:
+        break; /* fall through to JSON encode below */
+    case IS_OBJECT:
+        if (get_datetime_ce() && instanceof_function(Z_OBJCE_P(val), get_datetime_ce())) {
+            int64_t nanos;
+            if (datetime_to_nanos(val, &nanos) != 0) return FAILURE;
+            out->value_type = 5;
+            out->v.timestamp_nanos = nanos;
+            return SUCCESS;
+        }
+        break; /* fall through to JSON encode below */
+    default:
+        zend_throw_exception_ex(stoolap_exception_ce, 0,
+            "Unsupported parameter type: %s", zend_zval_type_name(val));
+        return FAILURE;
+    }
+
+    /* JSON encode (arrays and non-DateTime objects) */
+    smart_str buf = {0};
+    if (php_json_encode(&buf, val, PHP_JSON_UNESCAPED_UNICODE | PHP_JSON_UNESCAPED_SLASHES) == FAILURE) {
+        smart_str_free(&buf);
+        zend_throw_exception(stoolap_exception_ce,
+            "Failed to JSON-encode parameter", 0);
+        return FAILURE;
+    }
+    smart_str_0(&buf);
+
+    out->value_type = 6;
+    out->v.text.ptr = ZSTR_VAL(buf.s);
+    out->v.text.len = ZSTR_LEN(buf.s);
+
+    /* Track JSON string for cleanup */
+    if (*json_count >= *json_alloc) {
+        *json_alloc = *json_alloc ? *json_alloc * 2 : 4;
+        *json_strs = erealloc(*json_strs, sizeof(zend_string *) * *json_alloc);
+    }
+    (*json_strs)[(*json_count)++] = buf.s;
+    return SUCCESS;
+}
+
+/* ================================================================
  * Build StoolapValue array from PHP array
  * ================================================================ */
 
@@ -619,82 +706,9 @@ static int stoolap_build_params(zval *params, stoolap_params_t *out)
     int idx = 0;
     zval *val;
     ZEND_HASH_FOREACH_VAL(ht, val) {
-        values[idx]._padding = 0;
-
-        if (Z_TYPE_P(val) == IS_NULL) {
-            values[idx].value_type = 0;
-        } else if (Z_TYPE_P(val) == IS_TRUE) {
-            values[idx].value_type = 4;
-            values[idx].v.boolean = 1;
-        } else if (Z_TYPE_P(val) == IS_FALSE) {
-            values[idx].value_type = 4;
-            values[idx].v.boolean = 0;
-        } else if (Z_TYPE_P(val) == IS_LONG) {
-            values[idx].value_type = 1;
-            values[idx].v.integer = Z_LVAL_P(val);
-        } else if (Z_TYPE_P(val) == IS_DOUBLE) {
-            values[idx].value_type = 2;
-            values[idx].v.float64 = Z_DVAL_P(val);
-        } else if (Z_TYPE_P(val) == IS_STRING) {
-            values[idx].value_type = 3;
-            values[idx].v.text.ptr = Z_STRVAL_P(val);
-            values[idx].v.text.len = Z_STRLEN_P(val);
-        } else if (Z_TYPE_P(val) == IS_ARRAY) {
-            /* JSON encode */
-            smart_str buf = {0};
-            if (php_json_encode(&buf, val, PHP_JSON_UNESCAPED_UNICODE | PHP_JSON_UNESCAPED_SLASHES) == FAILURE) {
-                smart_str_free(&buf);
-                zend_throw_exception(stoolap_exception_ce,
-                    "Failed to JSON-encode array parameter", 0);
-                return FAILURE;
-            }
-            smart_str_0(&buf);
-
-            values[idx].value_type = 6;
-            values[idx].v.text.ptr = ZSTR_VAL(buf.s);
-            values[idx].v.text.len = ZSTR_LEN(buf.s);
-
-            /* Track for cleanup */
-            if (out->json_count >= out->json_alloc) {
-                out->json_alloc = out->json_alloc ? out->json_alloc * 2 : 4;
-                out->json_strs = erealloc(out->json_strs, sizeof(zend_string *) * out->json_alloc);
-            }
-            out->json_strs[out->json_count++] = buf.s;
-        } else if (Z_TYPE_P(val) == IS_OBJECT) {
-            if (datetime_interface_ce && instanceof_function(Z_OBJCE_P(val), datetime_interface_ce)) {
-                int64_t nanos;
-                if (datetime_to_nanos(val, &nanos) != 0) {
-                    return FAILURE;
-                }
-                values[idx].value_type = 5;
-                values[idx].v.timestamp_nanos = nanos;
-            } else {
-                /* JSON encode object */
-                smart_str buf = {0};
-                if (php_json_encode(&buf, val, PHP_JSON_UNESCAPED_UNICODE | PHP_JSON_UNESCAPED_SLASHES) == FAILURE) {
-                    smart_str_free(&buf);
-                    zend_throw_exception(stoolap_exception_ce,
-                        "Failed to JSON-encode object parameter", 0);
-                    return FAILURE;
-                }
-                smart_str_0(&buf);
-
-                values[idx].value_type = 6;
-                values[idx].v.text.ptr = ZSTR_VAL(buf.s);
-                values[idx].v.text.len = ZSTR_LEN(buf.s);
-
-                if (out->json_count >= out->json_alloc) {
-                    out->json_alloc = out->json_alloc ? out->json_alloc * 2 : 4;
-                    out->json_strs = erealloc(out->json_strs, sizeof(zend_string *) * out->json_alloc);
-                }
-                out->json_strs[out->json_count++] = buf.s;
-            }
-        } else {
-            zend_throw_exception_ex(stoolap_exception_ce, 0,
-                "Unsupported parameter type: %s", zend_zval_type_name(val));
+        if (fill_one_param(val, &values[idx], &out->json_strs, &out->json_count, &out->json_alloc) != SUCCESS) {
             return FAILURE;
         }
-
         idx++;
     } ZEND_HASH_FOREACH_END();
 
@@ -722,64 +736,7 @@ static int stoolap_batch_fill_params(zval *params, StoolapValue *values, int32_t
     int idx = 0;
     zval *val;
     ZEND_HASH_FOREACH_VAL(ht, val) {
-        values[idx]._padding = 0;
-
-        if (Z_TYPE_P(val) == IS_NULL) {
-            values[idx].value_type = 0;
-        } else if (Z_TYPE_P(val) == IS_TRUE) {
-            values[idx].value_type = 4;
-            values[idx].v.boolean = 1;
-        } else if (Z_TYPE_P(val) == IS_FALSE) {
-            values[idx].value_type = 4;
-            values[idx].v.boolean = 0;
-        } else if (Z_TYPE_P(val) == IS_LONG) {
-            values[idx].value_type = 1;
-            values[idx].v.integer = Z_LVAL_P(val);
-        } else if (Z_TYPE_P(val) == IS_DOUBLE) {
-            values[idx].value_type = 2;
-            values[idx].v.float64 = Z_DVAL_P(val);
-        } else if (Z_TYPE_P(val) == IS_STRING) {
-            values[idx].value_type = 3;
-            values[idx].v.text.ptr = Z_STRVAL_P(val);
-            values[idx].v.text.len = Z_STRLEN_P(val);
-        } else if (Z_TYPE_P(val) == IS_ARRAY) {
-            smart_str buf = {0};
-            if (php_json_encode(&buf, val, PHP_JSON_UNESCAPED_UNICODE | PHP_JSON_UNESCAPED_SLASHES) == FAILURE) {
-                smart_str_free(&buf);
-                zend_throw_exception(stoolap_exception_ce,
-                    "Failed to JSON-encode array parameter", 0);
-                return FAILURE;
-            }
-            smart_str_0(&buf);
-            values[idx].value_type = 6;
-            values[idx].v.text.ptr = ZSTR_VAL(buf.s);
-            values[idx].v.text.len = ZSTR_LEN(buf.s);
-            json_strs[(*json_count)++] = buf.s;
-        } else if (Z_TYPE_P(val) == IS_OBJECT) {
-            if (datetime_interface_ce && instanceof_function(Z_OBJCE_P(val), datetime_interface_ce)) {
-                int64_t nanos;
-                if (datetime_to_nanos(val, &nanos) != 0) {
-                    return FAILURE;
-                }
-                values[idx].value_type = 5;
-                values[idx].v.timestamp_nanos = nanos;
-            } else {
-                smart_str buf = {0};
-                if (php_json_encode(&buf, val, PHP_JSON_UNESCAPED_UNICODE | PHP_JSON_UNESCAPED_SLASHES) == FAILURE) {
-                    smart_str_free(&buf);
-                    zend_throw_exception(stoolap_exception_ce,
-                        "Failed to JSON-encode object parameter", 0);
-                    return FAILURE;
-                }
-                smart_str_0(&buf);
-                values[idx].value_type = 6;
-                values[idx].v.text.ptr = ZSTR_VAL(buf.s);
-                values[idx].v.text.len = ZSTR_LEN(buf.s);
-                json_strs[(*json_count)++] = buf.s;
-            }
-        } else {
-            zend_throw_exception_ex(stoolap_exception_ce, 0,
-                "Unsupported parameter type: %s", zend_zval_type_name(val));
+        if (fill_one_param(val, &values[idx], &json_strs, json_count, &json_alloc) != SUCCESS) {
             return FAILURE;
         }
         idx++;
@@ -986,72 +943,7 @@ static int stoolap_stmt_build_params(stoolap_stmt_obj *sobj, zval *params, stool
     int idx = 0;
     zval *val;
     ZEND_HASH_FOREACH_VAL(ht, val) {
-        values[idx]._padding = 0;
-
-        if (Z_TYPE_P(val) == IS_NULL) {
-            values[idx].value_type = 0;
-        } else if (Z_TYPE_P(val) == IS_TRUE) {
-            values[idx].value_type = 4;
-            values[idx].v.boolean = 1;
-        } else if (Z_TYPE_P(val) == IS_FALSE) {
-            values[idx].value_type = 4;
-            values[idx].v.boolean = 0;
-        } else if (Z_TYPE_P(val) == IS_LONG) {
-            values[idx].value_type = 1;
-            values[idx].v.integer = Z_LVAL_P(val);
-        } else if (Z_TYPE_P(val) == IS_DOUBLE) {
-            values[idx].value_type = 2;
-            values[idx].v.float64 = Z_DVAL_P(val);
-        } else if (Z_TYPE_P(val) == IS_STRING) {
-            values[idx].value_type = 3;
-            values[idx].v.text.ptr = Z_STRVAL_P(val);
-            values[idx].v.text.len = Z_STRLEN_P(val);
-        } else if (Z_TYPE_P(val) == IS_ARRAY) {
-            smart_str buf = {0};
-            if (php_json_encode(&buf, val, PHP_JSON_UNESCAPED_UNICODE | PHP_JSON_UNESCAPED_SLASHES) == FAILURE) {
-                smart_str_free(&buf);
-                zend_throw_exception(stoolap_exception_ce,
-                    "Failed to JSON-encode array parameter", 0);
-                return FAILURE;
-            }
-            smart_str_0(&buf);
-            values[idx].value_type = 6;
-            values[idx].v.text.ptr = ZSTR_VAL(buf.s);
-            values[idx].v.text.len = ZSTR_LEN(buf.s);
-            if (out->json_count >= out->json_alloc) {
-                out->json_alloc = out->json_alloc ? out->json_alloc * 2 : 4;
-                out->json_strs = erealloc(out->json_strs, sizeof(zend_string *) * out->json_alloc);
-            }
-            out->json_strs[out->json_count++] = buf.s;
-        } else if (Z_TYPE_P(val) == IS_OBJECT) {
-            if (datetime_interface_ce && instanceof_function(Z_OBJCE_P(val), datetime_interface_ce)) {
-                int64_t nanos;
-                if (datetime_to_nanos(val, &nanos) != 0) {
-                    return FAILURE;
-                }
-                values[idx].value_type = 5;
-                values[idx].v.timestamp_nanos = nanos;
-            } else {
-                smart_str buf = {0};
-                if (php_json_encode(&buf, val, PHP_JSON_UNESCAPED_UNICODE | PHP_JSON_UNESCAPED_SLASHES) == FAILURE) {
-                    smart_str_free(&buf);
-                    zend_throw_exception(stoolap_exception_ce,
-                        "Failed to JSON-encode object parameter", 0);
-                    return FAILURE;
-                }
-                smart_str_0(&buf);
-                values[idx].value_type = 6;
-                values[idx].v.text.ptr = ZSTR_VAL(buf.s);
-                values[idx].v.text.len = ZSTR_LEN(buf.s);
-                if (out->json_count >= out->json_alloc) {
-                    out->json_alloc = out->json_alloc ? out->json_alloc * 2 : 4;
-                    out->json_strs = erealloc(out->json_strs, sizeof(zend_string *) * out->json_alloc);
-                }
-                out->json_strs[out->json_count++] = buf.s;
-            }
-        } else {
-            zend_throw_exception_ex(stoolap_exception_ce, 0,
-                "Unsupported parameter type: %s", zend_zval_type_name(val));
+        if (fill_one_param(val, &values[idx], &out->json_strs, &out->json_count, &out->json_alloc) != SUCCESS) {
             return FAILURE;
         }
         idx++;
@@ -1129,6 +1021,324 @@ static char *normalize_dsn(const char *dsn, size_t dsn_len)
 }
 
 /* ================================================================
+ * Daemon proxy helpers
+ * ================================================================ */
+
+/* Check if we should use daemon mode */
+/* Write all bytes to fd, retrying on EINTR and short writes. */
+static int sock_write_all(int fd, const void *buf, size_t len)
+{
+    const uint8_t *p = (const uint8_t *)buf;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(fd, p + off, len - off);
+        if (n < 0) { if (errno == EINTR) continue; return -1; }
+        off += (size_t)n;
+    }
+    return 0;
+}
+
+static int stoolap_use_daemon(void)
+{
+    const char *env = getenv("STOOLAP_DAEMON");
+    if (env) {
+        if (strcmp(env, "0") == 0 || strcmp(env, "off") == 0) return 0;
+        if (strcmp(env, "1") == 0 || strcmp(env, "on") == 0) return 1;
+    }
+    const char *sapi = sapi_module.name;
+    if (sapi && (strstr(sapi, "fpm") || strstr(sapi, "cgi") || strstr(sapi, "apache")))
+        return 1;
+    return 0;
+}
+
+/* Connect to daemon, perform handshake. Returns 0 on success. */
+static int proxy_connect(stoolap_db_obj *obj, const char *dsn, size_t dsn_len)
+{
+    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sock < 0) return -1;
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, STOOLAP_DAEMON_SOCK, sizeof(addr.sun_path) - 1);
+
+    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        php_error_docref(NULL, E_WARNING, "stoolap proxy: connect failed: %s", strerror(errno));
+        close(sock);
+        return -1;
+    }
+
+    /* Send DSN: [u32 len][bytes] */
+    uint32_t dlen = (uint32_t)dsn_len;
+    if (sock_write_all(sock, &dlen, 4) < 0) { close(sock); return -1; }
+    if (dsn_len > 0 && sock_write_all(sock, dsn, dsn_len) < 0) {
+        close(sock); return -1;
+    }
+
+    /* Receive handshake: [u8 status][u8 name_len][shm_name]
+     * Read in a loop to handle SOCK_STREAM short reads.
+     * First read 2 bytes (status + name_len), then the name. */
+    uint8_t resp_buf[64];
+    ssize_t n = 0;
+    while (n < 2) {
+        ssize_t r = read(sock, resp_buf + n, sizeof(resp_buf) - (size_t)n);
+        if (r <= 0) { php_error_docref(NULL, E_WARNING, "stoolap proxy: handshake read failed"); close(sock); return -1; }
+        n += r;
+    }
+
+    uint8_t status = resp_buf[0];
+    if (status != 0) { close(sock); return -1; }
+
+    uint8_t name_len = resp_buf[1];
+    if (name_len == 0 || name_len > 31) { close(sock); return -1; }
+
+    /* Read remaining bytes if name wasn't fully received */
+    while (n < 2 + name_len) {
+        ssize_t r = read(sock, resp_buf + n, (size_t)(2 + name_len) - (size_t)n);
+        if (r <= 0) { close(sock); return -1; }
+        n += r;
+    }
+
+    char shm_name[32];
+    memcpy(shm_name, resp_buf + 2, name_len);
+    shm_name[name_len] = '\0';
+
+    int shm_fd = shm_open(shm_name, O_RDWR, 0);
+    if (shm_fd < 0) { php_error_docref(NULL, E_WARNING, "stoolap proxy: shm_open(%s) failed: %s", shm_name, strerror(errno)); close(sock); return -1; }
+
+    void *base = mmap(NULL, SHM_TOTAL_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    close(shm_fd);
+    if (base == MAP_FAILED) { close(sock); return -1; }
+
+    obj->proxy_fd = sock;
+    obj->shm_base = base;
+    strncpy(obj->shm_name, shm_name, sizeof(obj->shm_name) - 1);
+
+    /* Send OP_OPEN via SHM + futex/ulock wake */
+    uint8_t *req = SHM_REQ(base);
+    memcpy(req, &dlen, 4);
+    if (dsn_len > 0) memcpy(req + 4, dsn, dsn_len);
+
+    stoolap_ctl_t *ctl = SHM_CTL(base);
+    ctl->opcode = OP_OPEN;
+    ctl->req_len = 4 + (uint32_t)dsn_len;
+
+    __atomic_store_n(&ctl->req_ready, 1, __ATOMIC_RELEASE);
+    shm_wake(&ctl->req_ready);
+
+    /* Wait for OP_OPEN response: spin then kernel wait */
+    int open_ok = 0;
+    for (int i = 0; i < SPIN_ITERS; i++) {
+        if (__atomic_load_n(&ctl->resp_ready, __ATOMIC_ACQUIRE)) { open_ok = 1; break; }
+        CPU_PAUSE();
+    }
+    if (!open_ok) {
+        for (int attempt = 0; attempt < 100; attempt++) { /* 100 * 100ms = 10s */
+            shm_wait(&ctl->resp_ready, 0, 100000); /* 100ms */
+            if (__atomic_load_n(&ctl->resp_ready, __ATOMIC_ACQUIRE)) { open_ok = 1; break; }
+            /* Check if daemon closed socket (thread died before processing OP_OPEN) */
+            struct pollfd pfd = { .fd = sock, .events = 0 };
+            if (poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLHUP | POLLERR))) goto fail;
+        }
+    }
+    if (!open_ok) goto fail;
+    __atomic_store_n(&ctl->resp_ready, 0, __ATOMIC_RELEASE);
+    if (ctl->resp_status != RESP_OK) goto fail;
+
+    return 0;
+
+fail:
+    munmap(base, SHM_TOTAL_SIZE);
+    close(sock);
+    obj->proxy_fd = -1;
+    obj->shm_base = NULL;
+    return -1;
+}
+
+/* IPC round-trip: signal daemon, wait for response.
+ * Caller must have already written opcode + request data to shm.
+ *
+ * Wait strategy: spin on atomic flag (catches fast responses in <4μs),
+ * then shm_wait (futex/ulock) which blocks with single syscall.
+ * No pipes, no poll, no drain, no stale-byte race. */
+static int proxy_roundtrip(stoolap_db_obj *obj)
+{
+    stoolap_ctl_t *ctl = SHM_CTL(obj->shm_base);
+
+    /* Signal request: atomic flag + kernel wake */
+    __atomic_store_n(&ctl->req_ready, 1, __ATOMIC_RELEASE);
+    shm_wake(&ctl->req_ready);
+
+    /* Phase 1: fast spin */
+    for (int i = 0; i < SPIN_ITERS; i++) {
+        if (__atomic_load_n(&ctl->resp_ready, __ATOMIC_ACQUIRE)) {
+            __atomic_store_n(&ctl->resp_ready, 0, __ATOMIC_RELEASE);
+            return 0;
+        }
+        CPU_PAUSE();
+    }
+
+    /* Phase 2: kernel wait (futex on Linux, __ulock on macOS).
+     * shm_wait blocks if resp_ready == 0, returns instantly if != 0.
+     * No pipe, no poll, no stale bytes — single syscall. */
+    for (;;) {
+        shm_wait(&ctl->resp_ready, 0, 30000000); /* 30s timeout */
+        if (__atomic_load_n(&ctl->resp_ready, __ATOMIC_ACQUIRE)) {
+            __atomic_store_n(&ctl->resp_ready, 0, __ATOMIC_RELEASE);
+            return 0;
+        }
+        /* Timeout or spurious wakeup — check if still worth waiting */
+        struct pollfd pfd = { .fd = obj->proxy_fd, .events = 0 };
+        if (poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLHUP | POLLERR))) {
+            return -1; /* daemon connection lost */
+        }
+    }
+}
+
+/* Throw exception from daemon error response.
+ * Null-terminates in-place in SHM (writable) to avoid heap allocation. */
+static void proxy_throw_error(stoolap_db_obj *obj)
+{
+    stoolap_ctl_t *ctl = SHM_CTL(obj->shm_base);
+    uint8_t *resp = SHM_RESP(obj->shm_base);
+    if (ctl->resp_len >= 4) {
+        uint32_t err_len;
+        memcpy(&err_len, resp, 4);
+        if (err_len > 0 && 4 + err_len <= ctl->resp_len && 4 + err_len < SHM_RESP_MAX) {
+            resp[4 + err_len] = '\0'; /* null-terminate in-place in writable SHM */
+            zend_throw_exception(stoolap_exception_ce, (const char *)(resp + 4), 0);
+            return;
+        }
+    }
+    zend_throw_exception(stoolap_exception_ce, "daemon error", 0);
+}
+
+/* Get proxy db_obj from a zval reference (for stmt/tx objects) */
+static inline stoolap_db_obj *proxy_db_from_zv(zval *db_zv) {
+    if (Z_TYPE_P(db_zv) == IS_OBJECT)
+        return stoolap_db_from_obj(Z_OBJ_P(db_zv));
+    return NULL;
+}
+
+/* Disconnect from daemon */
+static void proxy_disconnect(stoolap_db_obj *obj)
+{
+    if (!PROXY_ACTIVE(obj)) return;
+
+    /* Send OP_CLOSE */
+    SHM_CTL(obj->shm_base)->opcode = OP_CLOSE;
+    SHM_CTL(obj->shm_base)->req_len = 0;
+    proxy_roundtrip(obj); /* best-effort */
+
+    munmap(obj->shm_base, SHM_TOTAL_SIZE);
+    obj->shm_base = NULL;
+    close(obj->proxy_fd);
+    obj->proxy_fd = -1;
+}
+
+/* Fork the daemon if not already running.
+ * Returns 0 if daemon is running (may have been freshly forked), -1 on failure. */
+static int ensure_daemon_running(void)
+{
+    /* Lazy init paths if not already done (CLI with STOOLAP_DAEMON=1) */
+    if (g_daemon_sock[0] == '\0') {
+        stoolap_daemon_init_paths(getpid());
+    }
+
+    /* Check if daemon socket exists (avoids spurious fork) */
+    struct stat st;
+    if (stat(STOOLAP_DAEMON_SOCK, &st) == 0 && S_ISSOCK(st.st_mode)) {
+        return 0; /* socket exists, daemon likely running */
+    }
+
+    /* Double-fork to avoid zombie: fork → intermediate → fork → daemon.
+     * Intermediate exits immediately, parent waitpid's it.
+     * Daemon is reparented to init/launchd — no zombie.
+     * No lock needed — socket path is per-PID, only we fork this daemon. */
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        /* Intermediate process */
+        pid_t daemon_pid = fork();
+        if (daemon_pid == 0) {
+            /* Daemon process */
+            int max_fd = (int)sysconf(_SC_OPEN_MAX);
+            if (max_fd < 0) max_fd = 1024;
+            for (int i = 3; i < max_fd; i++) close(i);
+
+            if (!getenv("STOOLAP_DAEMON_DEBUG")) {
+                int devnull = open("/dev/null", O_RDWR);
+                if (devnull >= 0) {
+                    dup2(devnull, STDOUT_FILENO);
+                    dup2(devnull, STDERR_FILENO);
+                    close(devnull);
+                }
+            }
+            stoolap_daemon_run(NULL, 0); /* never returns */
+            _exit(0);
+        }
+        _exit(0);
+    }
+
+    /* Parent: wait for intermediate (instant, no zombie) */
+    waitpid(pid, NULL, 0);
+
+    for (int i = 0; i < 40; i++) { /* 40 * 50ms = 2s max */
+        usleep(50000);
+        if (stat(STOOLAP_DAEMON_SOCK, &st) == 0 && S_ISSOCK(st.st_mode)) {
+            return 0;
+        }
+    }
+    return -1; /* daemon failed to start */
+}
+
+/* Serialize StoolapValue params into shm request buffer.
+ * Returns bytes written, or -1 on overflow. */
+static int32_t proxy_write_params(uint8_t *buf, size_t max_len,
+    const StoolapValue *values, int32_t count)
+{
+    size_t off = 0;
+    for (int32_t i = 0; i < count; i++) {
+        if (off >= max_len) return -1;
+        buf[off++] = (uint8_t)values[i].value_type;
+        switch (values[i].value_type) {
+        case 0: break; /* null */
+        case 1: /* int64 */
+            if (off + 8 > max_len) return -1;
+            memcpy(buf + off, &values[i].v.integer, 8); off += 8;
+            break;
+        case 2: /* float64 */
+            if (off + 8 > max_len) return -1;
+            memcpy(buf + off, &values[i].v.float64, 8); off += 8;
+            break;
+        case 3: case 6: /* text, json */ {
+            uint32_t len = (uint32_t)values[i].v.text.len;
+            if (off + 4 + len > max_len) return -1;
+            memcpy(buf + off, &len, 4); off += 4;
+            memcpy(buf + off, values[i].v.text.ptr, len); off += len;
+            break;
+        }
+        case 4: /* bool */
+            if (off >= max_len) return -1;
+            buf[off++] = (uint8_t)values[i].v.boolean;
+            break;
+        case 5: /* timestamp */
+            if (off + 8 > max_len) return -1;
+            memcpy(buf + off, &values[i].v.timestamp_nanos, 8); off += 8;
+            break;
+        case 7: /* blob */ {
+            uint32_t len = (uint32_t)values[i].v.blob.len;
+            if (off + 4 + len > max_len) return -1;
+            memcpy(buf + off, &len, 4); off += 4;
+            memcpy(buf + off, values[i].v.blob.ptr, len); off += len;
+            break;
+        }
+        }
+    }
+    return (int32_t)off;
+}
+
+/* ================================================================
  * Object create / free handlers
  * ================================================================ */
 
@@ -1136,6 +1346,10 @@ static zend_object *stoolap_db_create(zend_class_entry *ce)
 {
     stoolap_db_obj *obj = zend_object_alloc(sizeof(stoolap_db_obj), ce);
     obj->db = NULL;
+    obj->proxy_fd = -1;
+    obj->shm_base = NULL;
+    obj->shm_name[0] = '\0';
+    obj->dsn[0] = '\0';
     zend_object_std_init(&obj->std, ce);
     obj->std.handlers = &stoolap_database_handlers;
     return &obj->std;
@@ -1144,7 +1358,9 @@ static zend_object *stoolap_db_create(zend_class_entry *ce)
 static void stoolap_db_free(zend_object *object)
 {
     stoolap_db_obj *obj = stoolap_db_from_obj(object);
-    if (obj->db) {
+    if (PROXY_ACTIVE(obj)) {
+        proxy_disconnect(obj);
+    } else if (obj->db) {
         stoolap_close(obj->db);
         obj->db = NULL;
     }
@@ -1160,6 +1376,7 @@ static zend_object *stoolap_stmt_create(zend_class_entry *ce)
     obj->param_name_count = 0;
     obj->cached_values = NULL;
     obj->cached_count = 0;
+    obj->proxy_stmt_id = 0;
     ZVAL_UNDEF(&obj->db_zv);
     zend_object_std_init(&obj->std, ce);
     obj->std.handlers = &stoolap_statement_handlers;
@@ -1169,7 +1386,17 @@ static zend_object *stoolap_stmt_create(zend_class_entry *ce)
 static void stoolap_stmt_free(zend_object *object)
 {
     stoolap_stmt_obj *obj = stoolap_stmt_from_obj(object);
-    if (obj->stmt) {
+    if (obj->proxy_stmt_id > 0 && Z_TYPE(obj->db_zv) == IS_OBJECT) {
+        stoolap_db_obj *dobj = proxy_db_from_zv(&obj->db_zv);
+        if (dobj && PROXY_ACTIVE(dobj)) {
+            uint8_t *req = SHM_REQ(dobj->shm_base);
+            memcpy(req, &obj->proxy_stmt_id, 4);
+            SHM_CTL(dobj->shm_base)->opcode = OP_STMT_FINALIZE;
+            SHM_CTL(dobj->shm_base)->req_len = 4;
+            proxy_roundtrip(dobj);
+        }
+        obj->proxy_stmt_id = 0;
+    } else if (obj->stmt) {
         stoolap_stmt_finalize(obj->stmt);
         obj->stmt = NULL;
     }
@@ -1198,6 +1425,7 @@ static zend_object *stoolap_tx_create(zend_class_entry *ce)
     stoolap_tx_obj *obj = zend_object_alloc(sizeof(stoolap_tx_obj), ce);
     obj->tx = NULL;
     obj->db = NULL;
+    obj->proxy_tx_id = 0;
     ZVAL_UNDEF(&obj->db_zv);
     zend_object_std_init(&obj->std, ce);
     obj->std.handlers = &stoolap_transaction_handlers;
@@ -1207,7 +1435,17 @@ static zend_object *stoolap_tx_create(zend_class_entry *ce)
 static void stoolap_tx_free(zend_object *object)
 {
     stoolap_tx_obj *obj = stoolap_tx_from_obj(object);
-    if (obj->tx) {
+    if (obj->proxy_tx_id > 0 && Z_TYPE(obj->db_zv) == IS_OBJECT) {
+        stoolap_db_obj *dobj = proxy_db_from_zv(&obj->db_zv);
+        if (dobj && PROXY_ACTIVE(dobj)) {
+            uint8_t *req = SHM_REQ(dobj->shm_base);
+            memcpy(req, &obj->proxy_tx_id, 4);
+            SHM_CTL(dobj->shm_base)->opcode = OP_TX_ROLLBACK;
+            SHM_CTL(dobj->shm_base)->req_len = 4;
+            proxy_roundtrip(dobj);
+        }
+        obj->proxy_tx_id = 0;
+    } else if (obj->tx) {
         stoolap_tx_rollback(obj->tx);
         obj->tx = NULL;
     }
@@ -1230,6 +1468,30 @@ PHP_METHOD(Stoolap_Database, open)
         Z_PARAM_STRING(dsn, dsn_len)
     ZEND_PARSE_PARAMETERS_END();
 
+    /* Determine the effective DSN for daemon communication */
+    const char *effective_dsn = dsn;
+    size_t effective_dsn_len = dsn_len;
+    if (dsn == NULL || dsn_len == 0 || strcmp(dsn, ":memory:") == 0) {
+        effective_dsn = "memory://";
+        effective_dsn_len = 9;
+    }
+
+    /* Try daemon mode */
+    if (stoolap_use_daemon()) {
+        if (ensure_daemon_running() == 0) {
+            object_init_ex(return_value, stoolap_database_ce);
+            stoolap_db_obj *obj = Z_STOOLAP_DB_P(return_value);
+            if (proxy_connect(obj, effective_dsn, effective_dsn_len) == 0) {
+                size_t copy_len = effective_dsn_len < sizeof(obj->dsn) - 1 ? effective_dsn_len : sizeof(obj->dsn) - 1;
+                memcpy(obj->dsn, effective_dsn, copy_len);
+                obj->dsn[copy_len] = '\0';
+                return;
+            }
+            /* proxy_connect failed — fall through to direct mode */
+        }
+    }
+
+    /* Direct mode */
     StoolapDB *db = NULL;
     int32_t rc;
 
@@ -1254,12 +1516,30 @@ PHP_METHOD(Stoolap_Database, open)
     object_init_ex(return_value, stoolap_database_ce);
     stoolap_db_obj *obj = Z_STOOLAP_DB_P(return_value);
     obj->db = db;
+    if (effective_dsn) {
+        size_t copy_len = effective_dsn_len < sizeof(obj->dsn) - 1 ? effective_dsn_len : sizeof(obj->dsn) - 1;
+        memcpy(obj->dsn, effective_dsn, copy_len);
+        obj->dsn[copy_len] = '\0';
+    }
 }
 
 PHP_METHOD(Stoolap_Database, openInMemory)
 {
     ZEND_PARSE_PARAMETERS_NONE();
 
+    /* Try daemon mode */
+    if (stoolap_use_daemon()) {
+        if (ensure_daemon_running() == 0) {
+            object_init_ex(return_value, stoolap_database_ce);
+            stoolap_db_obj *obj = Z_STOOLAP_DB_P(return_value);
+            if (proxy_connect(obj, "memory://", 9) == 0) {
+                strncpy(obj->dsn, "memory://", sizeof(obj->dsn) - 1);
+                return;
+            }
+        }
+    }
+
+    /* Direct mode */
     StoolapDB *db = NULL;
     int32_t rc = stoolap_open_in_memory(&db);
     if (rc != 0) {
@@ -1269,7 +1549,9 @@ PHP_METHOD(Stoolap_Database, openInMemory)
     }
 
     object_init_ex(return_value, stoolap_database_ce);
-    Z_STOOLAP_DB_P(return_value)->db = db;
+    stoolap_db_obj *obj = Z_STOOLAP_DB_P(return_value);
+    obj->db = db;
+    strncpy(obj->dsn, "memory://", sizeof(obj->dsn) - 1);
 }
 
 PHP_METHOD(Stoolap_Database, exec)
@@ -1282,7 +1564,7 @@ PHP_METHOD(Stoolap_Database, exec)
     ZEND_PARSE_PARAMETERS_END();
 
     stoolap_db_obj *obj = Z_STOOLAP_DB_P(ZEND_THIS);
-    if (!obj->db) {
+    if (!DB_IS_OPEN(obj)) {
         zend_throw_exception(stoolap_exception_ce, "Database is closed", 0);
         RETURN_THROWS();
     }
@@ -1290,6 +1572,29 @@ PHP_METHOD(Stoolap_Database, exec)
     size_t clean_len;
     char *clean_sql = strip_semicolon(sql, sql_len, &clean_len);
     const char *actual_sql = clean_sql ? clean_sql : sql;
+    size_t actual_len = clean_sql ? clean_len : sql_len;
+
+    if (PROXY_ACTIVE(obj)) {
+        uint8_t *req = SHM_REQ(obj->shm_base);
+        uint32_t slen = (uint32_t)actual_len;
+        memcpy(req, &slen, 4);
+        memcpy(req + 4, actual_sql, actual_len);
+        req[4 + actual_len] = '\0';
+        SHM_CTL(obj->shm_base)->opcode = OP_EXEC;
+        SHM_CTL(obj->shm_base)->req_len = 4 + slen + 1;
+        if (clean_sql) efree(clean_sql);
+        if (proxy_roundtrip(obj) != 0) {
+            zend_throw_exception(stoolap_exception_ce, "daemon communication error", 0);
+            RETURN_THROWS();
+        }
+        if (SHM_CTL(obj->shm_base)->resp_status != RESP_OK) {
+            proxy_throw_error(obj);
+            RETURN_THROWS();
+        }
+        int64_t affected;
+        memcpy(&affected, SHM_RESP(obj->shm_base), 8);
+        RETURN_LONG((zend_long)affected);
+    }
 
     int64_t affected = 0;
     int32_t rc = stoolap_exec(obj->db, actual_sql, &affected);
@@ -1317,7 +1622,7 @@ PHP_METHOD(Stoolap_Database, execute)
     ZEND_PARSE_PARAMETERS_END();
 
     stoolap_db_obj *obj = Z_STOOLAP_DB_P(ZEND_THIS);
-    if (!obj->db) {
+    if (!DB_IS_OPEN(obj)) {
         zend_throw_exception(stoolap_exception_ce, "Database is closed", 0);
         RETURN_THROWS();
     }
@@ -1337,6 +1642,7 @@ PHP_METHOD(Stoolap_Database, execute)
     }
 
     const char *final_sql = rewritten_sql ? rewritten_sql : actual_sql;
+    size_t final_sql_len = rewritten_sql ? strlen(rewritten_sql) : (clean_sql ? clean_len : sql_len);
     zval *final_params = Z_TYPE(positional_params) != IS_UNDEF ? &positional_params : params;
 
     stoolap_params_t sp;
@@ -1346,6 +1652,41 @@ PHP_METHOD(Stoolap_Database, execute)
         if (Z_TYPE(positional_params) != IS_UNDEF) zval_ptr_dtor(&positional_params);
         if (clean_sql) efree(clean_sql);
         RETURN_THROWS();
+    }
+
+    if (PROXY_ACTIVE(obj)) {
+        uint8_t *req = SHM_REQ(obj->shm_base);
+        size_t off = 0;
+        uint32_t slen = (uint32_t)final_sql_len + 1; /* include null byte */
+        memcpy(req + off, &slen, 4); off += 4;
+        memcpy(req + off, final_sql, final_sql_len);
+        req[off + final_sql_len] = '\0';
+        off += slen;
+        uint32_t pcnt = (uint32_t)sp.count;
+        memcpy(req + off, &pcnt, 4); off += 4;
+        int32_t pw = proxy_write_params(req + off, SHM_REQ_MAX - off, sp.values, sp.count);
+        stoolap_params_free(&sp);
+        if (rewritten_sql) efree(rewritten_sql);
+        if (Z_TYPE(positional_params) != IS_UNDEF) zval_ptr_dtor(&positional_params);
+        if (clean_sql) efree(clean_sql);
+        if (pw < 0) {
+            zend_throw_exception(stoolap_exception_ce, "params too large for shared memory", 0);
+            RETURN_THROWS();
+        }
+        off += pw;
+        SHM_CTL(obj->shm_base)->opcode = OP_EXEC_PARAMS;
+        SHM_CTL(obj->shm_base)->req_len = (uint32_t)off;
+        if (proxy_roundtrip(obj) != 0) {
+            zend_throw_exception(stoolap_exception_ce, "daemon communication error", 0);
+            RETURN_THROWS();
+        }
+        if (SHM_CTL(obj->shm_base)->resp_status != RESP_OK) {
+            proxy_throw_error(obj);
+            RETURN_THROWS();
+        }
+        int64_t affected;
+        memcpy(&affected, SHM_RESP(obj->shm_base), 8);
+        RETURN_LONG((zend_long)affected);
     }
 
     int64_t affected = 0;
@@ -1377,7 +1718,7 @@ PHP_METHOD(Stoolap_Database, executeBatch)
     ZEND_PARSE_PARAMETERS_END();
 
     stoolap_db_obj *obj = Z_STOOLAP_DB_P(ZEND_THIS);
-    if (!obj->db) {
+    if (!DB_IS_OPEN(obj)) {
         zend_throw_exception(stoolap_exception_ce, "Database is closed", 0);
         RETURN_THROWS();
     }
@@ -1402,6 +1743,131 @@ PHP_METHOD(Stoolap_Database, executeBatch)
         if (clean_sql) efree(clean_sql);
         clean_sql = rewritten_sql;
         final_sql = clean_sql;
+        final_sql_len = strlen(clean_sql);
+    }
+
+    /* Determine param count from first row */
+    zval *first_row_p;
+    ZEND_HASH_FOREACH_VAL(outer, first_row_p) { break; } ZEND_HASH_FOREACH_END();
+    int32_t params_per_row;
+    if (Z_TYPE_P(first_row_p) != IS_ARRAY) {
+        params_per_row = 0;
+    } else if (param_names && !zval_array_is_list(first_row_p)) {
+        params_per_row = (int32_t)param_name_count;
+    } else if (Z_TYPE_P(first_row_p) == IS_ARRAY && !zval_array_is_list(first_row_p) && !param_names) {
+        if (clean_sql) efree(clean_sql);
+        zend_throw_exception(stoolap_exception_ce,
+            "Associative array parameters require named placeholders (:name) in SQL; "
+            "use a sequential array for positional ($1, $2, ...) placeholders", 0);
+        RETURN_THROWS();
+    } else {
+        params_per_row = (int32_t)zend_hash_num_elements(Z_ARRVAL_P(first_row_p));
+    }
+
+    /* Proxy path for executeBatch: pre-allocate once, serialize all rows into shm */
+    if (PROXY_ACTIVE(obj)) {
+        uint8_t *req = SHM_REQ(obj->shm_base);
+        size_t off = 0;
+        uint32_t slen = (uint32_t)final_sql_len + 1;
+        memcpy(req + off, &slen, 4); off += 4;
+        memcpy(req + off, final_sql, final_sql_len);
+        req[off + final_sql_len] = '\0';
+        off += slen;
+        uint32_t ppr = (uint32_t)params_per_row;
+        memcpy(req + off, &ppr, 4); off += 4;
+        uint32_t bcnt = batch_len;
+        memcpy(req + off, &bcnt, 4); off += 4;
+
+        /* Pre-allocate param arrays once (reused per row) */
+        StoolapValue *batch_values = emalloc(params_per_row * sizeof(StoolapValue));
+        int batch_json_alloc = params_per_row;
+        zend_string **batch_json_strs = emalloc(batch_json_alloc * sizeof(zend_string *));
+        int batch_json_count = 0;
+
+        zval *row;
+        ZEND_HASH_FOREACH_VAL(outer, row) {
+            if (Z_TYPE_P(row) != IS_ARRAY) {
+                stoolap_batch_json_free(batch_json_strs, &batch_json_count);
+                efree(batch_values); efree(batch_json_strs);
+                if (param_names) {
+                    for (uint32_t i = 0; i < param_name_count; i++) zend_string_release(param_names[i]);
+                    efree(param_names);
+                }
+                if (clean_sql) efree(clean_sql);
+                zend_throw_exception(stoolap_exception_ce, "executeBatch: each element must be an array", 0);
+                RETURN_THROWS();
+            }
+            /* Reorder named params if needed */
+            zval positional;
+            ZVAL_UNDEF(&positional);
+            zval *fill_row = row;
+            if (param_names && !zval_array_is_list(row)) {
+                if (reorder_named_params(row, param_names, param_name_count, &positional) != SUCCESS) {
+                    stoolap_batch_json_free(batch_json_strs, &batch_json_count);
+                    efree(batch_values); efree(batch_json_strs);
+                    if (param_names) {
+                        for (uint32_t i = 0; i < param_name_count; i++) zend_string_release(param_names[i]);
+                        efree(param_names);
+                    }
+                    if (clean_sql) efree(clean_sql);
+                    RETURN_THROWS();
+                }
+                fill_row = &positional;
+            }
+            int fill_rc = stoolap_batch_fill_params(fill_row, batch_values, params_per_row,
+                                                     batch_json_strs, &batch_json_count, batch_json_alloc);
+            if (Z_TYPE(positional) != IS_UNDEF) zval_ptr_dtor(&positional);
+            if (fill_rc != SUCCESS) {
+                stoolap_batch_json_free(batch_json_strs, &batch_json_count);
+                efree(batch_values); efree(batch_json_strs);
+                if (param_names) {
+                    for (uint32_t i = 0; i < param_name_count; i++) zend_string_release(param_names[i]);
+                    efree(param_names);
+                }
+                if (clean_sql) efree(clean_sql);
+                if (!EG(exception)) {
+                    zend_throw_exception(stoolap_exception_ce,
+                        "executeBatch: parameter count mismatch (all rows must have the same number of parameters)", 0);
+                }
+                RETURN_THROWS();
+            }
+            int32_t pw = proxy_write_params(req + off, SHM_REQ_MAX - off, batch_values, params_per_row);
+            stoolap_batch_json_free(batch_json_strs, &batch_json_count);
+            if (pw < 0) {
+                efree(batch_values); efree(batch_json_strs);
+                if (param_names) {
+                    for (uint32_t i = 0; i < param_name_count; i++) zend_string_release(param_names[i]);
+                    efree(param_names);
+                }
+                if (clean_sql) efree(clean_sql);
+                zend_throw_exception(stoolap_exception_ce, "batch params too large for shared memory", 0);
+                RETURN_THROWS();
+            }
+            off += pw;
+        } ZEND_HASH_FOREACH_END();
+
+        efree(batch_values);
+        efree(batch_json_strs);
+
+        if (param_names) {
+            for (uint32_t i = 0; i < param_name_count; i++) zend_string_release(param_names[i]);
+            efree(param_names);
+        }
+        if (clean_sql) efree(clean_sql);
+
+        SHM_CTL(obj->shm_base)->opcode = OP_EXEC_BATCH;
+        SHM_CTL(obj->shm_base)->req_len = (uint32_t)off;
+        if (proxy_roundtrip(obj) != 0) {
+            zend_throw_exception(stoolap_exception_ce, "daemon communication error", 0);
+            RETURN_THROWS();
+        }
+        if (SHM_CTL(obj->shm_base)->resp_status != RESP_OK) {
+            proxy_throw_error(obj);
+            RETURN_THROWS();
+        }
+        int64_t affected;
+        memcpy(&affected, SHM_RESP(obj->shm_base), 8);
+        RETURN_LONG((zend_long)affected);
     }
 
     /* Determine param count from first row and pre-allocate ONCE */
@@ -1572,7 +2038,7 @@ static void stoolap_db_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
     ZEND_PARSE_PARAMETERS_END();
 
     stoolap_db_obj *obj = Z_STOOLAP_DB_P(ZEND_THIS);
-    if (!obj->db) {
+    if (!DB_IS_OPEN(obj)) {
         zend_throw_exception(stoolap_exception_ce, "Database is closed", 0);
         RETURN_THROWS();
     }
@@ -1593,25 +2059,111 @@ static void stoolap_db_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
         }
     }
 
-    StoolapRows *rows = NULL;
-    int32_t rc;
+    /* Named param rewrite (client-side, before proxy path) */
+    char *rewritten_sql = NULL;
+    zval positional_params;
+    ZVAL_UNDEF(&positional_params);
+    int has_params = (params != NULL && Z_TYPE_P(params) == IS_ARRAY && zend_hash_num_elements(Z_ARRVAL_P(params)) > 0);
 
-    if (params == NULL || Z_TYPE_P(params) != IS_ARRAY || zend_hash_num_elements(Z_ARRVAL_P(params)) == 0) {
-        rc = stoolap_query(obj->db, actual_sql, &rows);
-    } else {
-        /* Named param rewrite */
-        char *rewritten_sql = NULL;
-        zval positional_params;
-        ZVAL_UNDEF(&positional_params);
+    if (has_params) {
         if (rewrite_named_params_full(actual_sql, actual_len, params, &rewritten_sql, &positional_params) != SUCCESS) {
             if (limited_sql) efree(limited_sql);
             if (clean_sql) efree(clean_sql);
             RETURN_THROWS();
         }
+    }
 
-        const char *final_sql = rewritten_sql ? rewritten_sql : actual_sql;
-        zval *final_params = Z_TYPE(positional_params) != IS_UNDEF ? &positional_params : params;
+    const char *final_sql = rewritten_sql ? rewritten_sql : actual_sql;
+    size_t final_sql_len = rewritten_sql ? strlen(rewritten_sql) : actual_len;
+    zval *final_params = Z_TYPE(positional_params) != IS_UNDEF ? &positional_params : params;
 
+    if (PROXY_ACTIVE(obj)) {
+        uint8_t *req = SHM_REQ(obj->shm_base);
+        size_t off = 0;
+        uint8_t opcode;
+
+        if (has_params) {
+            /* OP_QUERY_PARAMS: [u32 sql_len][sql][u32 param_count][params...] */
+            uint32_t slen = (uint32_t)final_sql_len + 1;
+            memcpy(req + off, &slen, 4); off += 4;
+            memcpy(req + off, final_sql, final_sql_len);
+            req[off + final_sql_len] = '\0';
+            off += slen;
+            stoolap_params_t sp;
+            if (stoolap_build_params(final_params, &sp) != SUCCESS) {
+                stoolap_params_free(&sp);
+                if (rewritten_sql) efree(rewritten_sql);
+                if (Z_TYPE(positional_params) != IS_UNDEF) zval_ptr_dtor(&positional_params);
+                if (limited_sql) efree(limited_sql);
+                if (clean_sql) efree(clean_sql);
+                RETURN_THROWS();
+            }
+            uint32_t pcnt = (uint32_t)sp.count;
+            memcpy(req + off, &pcnt, 4); off += 4;
+            int32_t pw = proxy_write_params(req + off, SHM_REQ_MAX - off, sp.values, sp.count);
+            stoolap_params_free(&sp);
+            if (pw < 0) {
+                if (rewritten_sql) efree(rewritten_sql);
+                if (Z_TYPE(positional_params) != IS_UNDEF) zval_ptr_dtor(&positional_params);
+                if (limited_sql) efree(limited_sql);
+                if (clean_sql) efree(clean_sql);
+                zend_throw_exception(stoolap_exception_ce, "params too large for shared memory", 0);
+                RETURN_THROWS();
+            }
+            off += pw;
+            opcode = OP_QUERY_PARAMS;
+        } else {
+            /* OP_QUERY: [u32 sql_len][sql + null] */
+            uint32_t slen = (uint32_t)final_sql_len;
+            memcpy(req + off, &slen, 4); off += 4;
+            memcpy(req + off, final_sql, final_sql_len);
+            req[off + final_sql_len] = '\0';
+            off += final_sql_len + 1;
+            opcode = OP_QUERY;
+        }
+
+        if (rewritten_sql) efree(rewritten_sql);
+        if (Z_TYPE(positional_params) != IS_UNDEF) zval_ptr_dtor(&positional_params);
+        if (limited_sql) efree(limited_sql);
+        if (clean_sql) efree(clean_sql);
+
+        SHM_CTL(obj->shm_base)->opcode = opcode;
+        SHM_CTL(obj->shm_base)->req_len = (uint32_t)off;
+        if (proxy_roundtrip(obj) != 0) {
+            zend_throw_exception(stoolap_exception_ce, "daemon communication error", 0);
+            RETURN_THROWS();
+        }
+        if (SHM_CTL(obj->shm_base)->resp_status != RESP_OK) {
+            proxy_throw_error(obj);
+            RETURN_THROWS();
+        }
+        uint8_t *resp = SHM_RESP(obj->shm_base);
+        uint32_t buf_len = SHM_CTL(obj->shm_base)->resp_len;
+        if (buf_len > 0) {
+            if (mode == QUERY_RAW) {
+                parse_buffer_raw(resp, buf_len, return_value);
+            } else if (mode == QUERY_ONE) {
+                parse_buffer_one(resp, buf_len, return_value);
+            } else {
+                parse_buffer_assoc(resp, buf_len, return_value);
+            }
+        } else {
+            if (mode == QUERY_ONE) {
+                ZVAL_NULL(return_value);
+            } else {
+                array_init(return_value);
+            }
+        }
+        return;
+    }
+
+    /* Direct mode */
+    StoolapRows *rows = NULL;
+    int32_t rc;
+
+    if (!has_params) {
+        rc = stoolap_query(obj->db, actual_sql, &rows);
+    } else {
         stoolap_params_t sp;
         if (stoolap_build_params(final_params, &sp) != SUCCESS) {
             stoolap_params_free(&sp);
@@ -1625,10 +2177,10 @@ static void stoolap_db_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
         rc = stoolap_query_params(obj->db, final_sql, sp.values, sp.count, &rows);
 
         stoolap_params_free(&sp);
-        if (rewritten_sql) efree(rewritten_sql);
-        if (Z_TYPE(positional_params) != IS_UNDEF) zval_ptr_dtor(&positional_params);
     }
 
+    if (rewritten_sql) efree(rewritten_sql);
+    if (Z_TYPE(positional_params) != IS_UNDEF) zval_ptr_dtor(&positional_params);
     if (limited_sql) efree(limited_sql);
     if (clean_sql) efree(clean_sql);
 
@@ -1655,7 +2207,7 @@ PHP_METHOD(Stoolap_Database, prepare)
     ZEND_PARSE_PARAMETERS_END();
 
     stoolap_db_obj *obj = Z_STOOLAP_DB_P(ZEND_THIS);
-    if (!obj->db) {
+    if (!DB_IS_OPEN(obj)) {
         zend_throw_exception(stoolap_exception_ce, "Database is closed", 0);
         RETURN_THROWS();
     }
@@ -1672,6 +2224,52 @@ PHP_METHOD(Stoolap_Database, prepare)
                                                     &param_names, &param_name_count);
 
     const char *prepare_sql = rewritten_sql ? rewritten_sql : original_sql;
+    size_t prepare_sql_len = rewritten_sql ? strlen(rewritten_sql) : original_len;
+
+    if (PROXY_ACTIVE(obj)) {
+        uint8_t *req = SHM_REQ(obj->shm_base);
+        uint32_t slen = (uint32_t)prepare_sql_len;
+        memcpy(req, &slen, 4);
+        memcpy(req + 4, prepare_sql, prepare_sql_len);
+        req[4 + prepare_sql_len] = '\0';
+        SHM_CTL(obj->shm_base)->opcode = OP_PREPARE;
+        SHM_CTL(obj->shm_base)->req_len = 4 + slen + 1;
+        if (proxy_roundtrip(obj) != 0) {
+            if (rewritten_sql) efree(rewritten_sql);
+            if (clean_sql) efree(clean_sql);
+            if (param_names) {
+                for (uint32_t i = 0; i < param_name_count; i++) zend_string_release(param_names[i]);
+                efree(param_names);
+            }
+            zend_throw_exception(stoolap_exception_ce, "daemon communication error", 0);
+            RETURN_THROWS();
+        }
+        if (SHM_CTL(obj->shm_base)->resp_status != RESP_OK) {
+            if (rewritten_sql) efree(rewritten_sql);
+            if (clean_sql) efree(clean_sql);
+            if (param_names) {
+                for (uint32_t i = 0; i < param_name_count; i++) zend_string_release(param_names[i]);
+                efree(param_names);
+            }
+            proxy_throw_error(obj);
+            RETURN_THROWS();
+        }
+        uint32_t stmt_id;
+        memcpy(&stmt_id, SHM_RESP(obj->shm_base), 4);
+
+        object_init_ex(return_value, stoolap_statement_ce);
+        stoolap_stmt_obj *sobj = Z_STOOLAP_STMT_P(return_value);
+        sobj->stmt = NULL;
+        sobj->proxy_stmt_id = stmt_id;
+        sobj->sql = zend_string_init(original_sql, original_len, 0);
+        sobj->param_names = param_names;
+        sobj->param_name_count = param_name_count;
+        ZVAL_COPY(&sobj->db_zv, ZEND_THIS);
+
+        if (rewritten_sql) efree(rewritten_sql);
+        if (clean_sql) efree(clean_sql);
+        return;
+    }
 
     StoolapStmt *stmt = NULL;
     int32_t rc = stoolap_prepare(obj->db, prepare_sql, &stmt);
@@ -1705,9 +2303,35 @@ PHP_METHOD(Stoolap_Database, begin)
     ZEND_PARSE_PARAMETERS_NONE();
 
     stoolap_db_obj *obj = Z_STOOLAP_DB_P(ZEND_THIS);
-    if (!obj->db) {
+    if (!DB_IS_OPEN(obj)) {
         zend_throw_exception(stoolap_exception_ce, "Database is closed", 0);
         RETURN_THROWS();
+    }
+
+    if (PROXY_ACTIVE(obj)) {
+        int32_t isolation = 0; /* default */
+        uint8_t *req = SHM_REQ(obj->shm_base);
+        memcpy(req, &isolation, 4);
+        SHM_CTL(obj->shm_base)->opcode = OP_BEGIN;
+        SHM_CTL(obj->shm_base)->req_len = 4;
+        if (proxy_roundtrip(obj) != 0) {
+            zend_throw_exception(stoolap_exception_ce, "daemon communication error", 0);
+            RETURN_THROWS();
+        }
+        if (SHM_CTL(obj->shm_base)->resp_status != RESP_OK) {
+            proxy_throw_error(obj);
+            RETURN_THROWS();
+        }
+        uint32_t tx_id;
+        memcpy(&tx_id, SHM_RESP(obj->shm_base), 4);
+
+        object_init_ex(return_value, stoolap_transaction_ce);
+        stoolap_tx_obj *tx_obj = Z_STOOLAP_TX_P(return_value);
+        tx_obj->tx = NULL;
+        tx_obj->db = NULL;
+        tx_obj->proxy_tx_id = tx_id;
+        ZVAL_COPY(&tx_obj->db_zv, ZEND_THIS);
+        return;
     }
 
     StoolapTx *tx = NULL;
@@ -1730,9 +2354,35 @@ PHP_METHOD(Stoolap_Database, beginSnapshot)
     ZEND_PARSE_PARAMETERS_NONE();
 
     stoolap_db_obj *obj = Z_STOOLAP_DB_P(ZEND_THIS);
-    if (!obj->db) {
+    if (!DB_IS_OPEN(obj)) {
         zend_throw_exception(stoolap_exception_ce, "Database is closed", 0);
         RETURN_THROWS();
+    }
+
+    if (PROXY_ACTIVE(obj)) {
+        int32_t isolation = 1; /* snapshot */
+        uint8_t *req = SHM_REQ(obj->shm_base);
+        memcpy(req, &isolation, 4);
+        SHM_CTL(obj->shm_base)->opcode = OP_BEGIN;
+        SHM_CTL(obj->shm_base)->req_len = 4;
+        if (proxy_roundtrip(obj) != 0) {
+            zend_throw_exception(stoolap_exception_ce, "daemon communication error", 0);
+            RETURN_THROWS();
+        }
+        if (SHM_CTL(obj->shm_base)->resp_status != RESP_OK) {
+            proxy_throw_error(obj);
+            RETURN_THROWS();
+        }
+        uint32_t tx_id;
+        memcpy(&tx_id, SHM_RESP(obj->shm_base), 4);
+
+        object_init_ex(return_value, stoolap_transaction_ce);
+        stoolap_tx_obj *tx_obj = Z_STOOLAP_TX_P(return_value);
+        tx_obj->tx = NULL;
+        tx_obj->db = NULL;
+        tx_obj->proxy_tx_id = tx_id;
+        ZVAL_COPY(&tx_obj->db_zv, ZEND_THIS);
+        return;
     }
 
     StoolapTx *tx = NULL;
@@ -1755,9 +2405,22 @@ PHP_METHOD(Stoolap_Database, clone)
     ZEND_PARSE_PARAMETERS_NONE();
 
     stoolap_db_obj *obj = Z_STOOLAP_DB_P(ZEND_THIS);
-    if (!obj->db) {
+    if (!DB_IS_OPEN(obj)) {
         zend_throw_exception(stoolap_exception_ce, "Database is closed", 0);
         RETURN_THROWS();
+    }
+
+    if (PROXY_ACTIVE(obj)) {
+        /* Clone in proxy mode: open a new proxy connection to the same daemon */
+        object_init_ex(return_value, stoolap_database_ce);
+        stoolap_db_obj *new_obj = Z_STOOLAP_DB_P(return_value);
+        size_t dsn_len = strlen(obj->dsn);
+        if (proxy_connect(new_obj, obj->dsn, dsn_len) != 0) {
+            zend_throw_exception(stoolap_exception_ce, "clone: failed to connect to daemon", 0);
+            RETURN_THROWS();
+        }
+        memcpy(new_obj->dsn, obj->dsn, sizeof(new_obj->dsn));
+        return;
     }
 
     StoolapDB *new_db = NULL;
@@ -1769,7 +2432,9 @@ PHP_METHOD(Stoolap_Database, clone)
     }
 
     object_init_ex(return_value, stoolap_database_ce);
-    Z_STOOLAP_DB_P(return_value)->db = new_db;
+    stoolap_db_obj *new_obj = Z_STOOLAP_DB_P(return_value);
+    new_obj->db = new_db;
+    memcpy(new_obj->dsn, obj->dsn, sizeof(new_obj->dsn));
 }
 
 PHP_METHOD(Stoolap_Database, close)
@@ -1777,7 +2442,9 @@ PHP_METHOD(Stoolap_Database, close)
     ZEND_PARSE_PARAMETERS_NONE();
 
     stoolap_db_obj *obj = Z_STOOLAP_DB_P(ZEND_THIS);
-    if (obj->db) {
+    if (PROXY_ACTIVE(obj)) {
+        proxy_disconnect(obj);
+    } else if (obj->db) {
         stoolap_close(obj->db);
         obj->db = NULL;
     }
@@ -1788,9 +2455,27 @@ PHP_METHOD(Stoolap_Database, version)
     ZEND_PARSE_PARAMETERS_NONE();
 
     stoolap_db_obj *obj = Z_STOOLAP_DB_P(ZEND_THIS);
-    if (!obj->db) {
+    if (!DB_IS_OPEN(obj)) {
         zend_throw_exception(stoolap_exception_ce, "Database is closed", 0);
         RETURN_THROWS();
+    }
+
+    if (PROXY_ACTIVE(obj)) {
+        SHM_CTL(obj->shm_base)->opcode = OP_VERSION;
+        SHM_CTL(obj->shm_base)->req_len = 0;
+        if (proxy_roundtrip(obj) != 0) {
+            zend_throw_exception(stoolap_exception_ce, "daemon communication error", 0);
+            RETURN_THROWS();
+        }
+        if (SHM_CTL(obj->shm_base)->resp_status != RESP_OK) {
+            proxy_throw_error(obj);
+            RETURN_THROWS();
+        }
+        uint8_t *resp = SHM_RESP(obj->shm_base);
+        uint32_t ver_len;
+        memcpy(&ver_len, resp, 4);
+        RETVAL_STRINGL((char *)resp + 4, ver_len);
+        return;
     }
 
     const char *ver = stoolap_version();
@@ -1807,7 +2492,7 @@ static inline int stoolap_stmt_check_db(stoolap_stmt_obj *sobj)
 {
     if (Z_TYPE(sobj->db_zv) == IS_OBJECT) {
         stoolap_db_obj *db_obj = Z_STOOLAP_DB_P(&sobj->db_zv);
-        if (db_obj->db) return 1;
+        if (DB_IS_OPEN(db_obj)) return 1;
     }
     zend_throw_exception(stoolap_exception_ce, "Database has been closed", 0);
     return 0;
@@ -1845,7 +2530,7 @@ PHP_METHOD(Stoolap_Statement, execute)
     ZEND_PARSE_PARAMETERS_END();
 
     stoolap_stmt_obj *sobj = Z_STOOLAP_STMT_P(ZEND_THIS);
-    if (!sobj->stmt) {
+    if (!sobj->stmt && sobj->proxy_stmt_id == 0) {
         zend_throw_exception(stoolap_exception_ce, "Statement is finalized", 0);
         RETURN_THROWS();
     }
@@ -1864,6 +2549,37 @@ PHP_METHOD(Stoolap_Statement, execute)
         stoolap_stmt_params_free(&sp);
         if (Z_TYPE(normalized) != IS_UNDEF) zval_ptr_dtor(&normalized);
         RETURN_THROWS();
+    }
+
+    /* Proxy path */
+    stoolap_db_obj *dobj = proxy_db_from_zv(&sobj->db_zv);
+    if (dobj && PROXY_ACTIVE(dobj) && sobj->proxy_stmt_id > 0) {
+        uint8_t *req = SHM_REQ(dobj->shm_base);
+        size_t off = 0;
+        memcpy(req + off, &sobj->proxy_stmt_id, 4); off += 4;
+        uint32_t pcnt = (uint32_t)sp.count;
+        memcpy(req + off, &pcnt, 4); off += 4;
+        int32_t pw = proxy_write_params(req + off, SHM_REQ_MAX - off, sp.values, sp.count);
+        stoolap_stmt_params_free(&sp);
+        if (Z_TYPE(normalized) != IS_UNDEF) zval_ptr_dtor(&normalized);
+        if (pw < 0) {
+            zend_throw_exception(stoolap_exception_ce, "params too large for shared memory", 0);
+            RETURN_THROWS();
+        }
+        off += pw;
+        SHM_CTL(dobj->shm_base)->opcode = OP_STMT_EXEC;
+        SHM_CTL(dobj->shm_base)->req_len = (uint32_t)off;
+        if (proxy_roundtrip(dobj) != 0) {
+            zend_throw_exception(stoolap_exception_ce, "daemon communication error", 0);
+            RETURN_THROWS();
+        }
+        if (SHM_CTL(dobj->shm_base)->resp_status != RESP_OK) {
+            proxy_throw_error(dobj);
+            RETURN_THROWS();
+        }
+        int64_t affected;
+        memcpy(&affected, SHM_RESP(dobj->shm_base), 8);
+        RETURN_LONG((zend_long)affected);
     }
 
     int64_t affected = 0;
@@ -1891,7 +2607,7 @@ static void stoolap_stmt_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
     ZEND_PARSE_PARAMETERS_END();
 
     stoolap_stmt_obj *sobj = Z_STOOLAP_STMT_P(ZEND_THIS);
-    if (!sobj->stmt) {
+    if (!sobj->stmt && sobj->proxy_stmt_id == 0) {
         zend_throw_exception(stoolap_exception_ce, "Statement is finalized", 0);
         RETURN_THROWS();
     }
@@ -1910,6 +2626,52 @@ static void stoolap_stmt_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
         stoolap_stmt_params_free(&sp);
         if (Z_TYPE(normalized) != IS_UNDEF) zval_ptr_dtor(&normalized);
         RETURN_THROWS();
+    }
+
+    /* Proxy path */
+    stoolap_db_obj *dobj = proxy_db_from_zv(&sobj->db_zv);
+    if (dobj && PROXY_ACTIVE(dobj) && sobj->proxy_stmt_id > 0) {
+        uint8_t *req = SHM_REQ(dobj->shm_base);
+        size_t off = 0;
+        memcpy(req + off, &sobj->proxy_stmt_id, 4); off += 4;
+        uint32_t pcnt = (uint32_t)sp.count;
+        memcpy(req + off, &pcnt, 4); off += 4;
+        int32_t pw = proxy_write_params(req + off, SHM_REQ_MAX - off, sp.values, sp.count);
+        stoolap_stmt_params_free(&sp);
+        if (Z_TYPE(normalized) != IS_UNDEF) zval_ptr_dtor(&normalized);
+        if (pw < 0) {
+            zend_throw_exception(stoolap_exception_ce, "params too large for shared memory", 0);
+            RETURN_THROWS();
+        }
+        off += pw;
+        SHM_CTL(dobj->shm_base)->opcode = OP_STMT_QUERY;
+        SHM_CTL(dobj->shm_base)->req_len = (uint32_t)off;
+        if (proxy_roundtrip(dobj) != 0) {
+            zend_throw_exception(stoolap_exception_ce, "daemon communication error", 0);
+            RETURN_THROWS();
+        }
+        if (SHM_CTL(dobj->shm_base)->resp_status != RESP_OK) {
+            proxy_throw_error(dobj);
+            RETURN_THROWS();
+        }
+        uint8_t *resp = SHM_RESP(dobj->shm_base);
+        uint32_t buf_len = SHM_CTL(dobj->shm_base)->resp_len;
+        if (buf_len > 0) {
+            if (mode == QUERY_RAW) {
+                parse_buffer_raw(resp, buf_len, return_value);
+            } else if (mode == QUERY_ONE) {
+                parse_buffer_one(resp, buf_len, return_value);
+            } else {
+                parse_buffer_assoc(resp, buf_len, return_value);
+            }
+        } else {
+            if (mode == QUERY_ONE) {
+                ZVAL_NULL(return_value);
+            } else {
+                array_init(return_value);
+            }
+        }
+        return;
     }
 
     StoolapRows *rows = NULL;
@@ -1947,7 +2709,17 @@ PHP_METHOD(Stoolap_Statement, finalize)
     ZEND_PARSE_PARAMETERS_NONE();
 
     stoolap_stmt_obj *sobj = Z_STOOLAP_STMT_P(ZEND_THIS);
-    if (sobj->stmt) {
+    if (sobj->proxy_stmt_id > 0 && Z_TYPE(sobj->db_zv) == IS_OBJECT) {
+        stoolap_db_obj *dobj = proxy_db_from_zv(&sobj->db_zv);
+        if (dobj && PROXY_ACTIVE(dobj)) {
+            uint8_t *req = SHM_REQ(dobj->shm_base);
+            memcpy(req, &sobj->proxy_stmt_id, 4);
+            SHM_CTL(dobj->shm_base)->opcode = OP_STMT_FINALIZE;
+            SHM_CTL(dobj->shm_base)->req_len = 4;
+            proxy_roundtrip(dobj);
+        }
+        sobj->proxy_stmt_id = 0;
+    } else if (sobj->stmt) {
         stoolap_stmt_finalize(sobj->stmt);
         sobj->stmt = NULL;
     }
@@ -1963,7 +2735,7 @@ static inline int stoolap_tx_check_db(stoolap_tx_obj *obj)
 {
     if (Z_TYPE(obj->db_zv) == IS_OBJECT) {
         stoolap_db_obj *db_obj = Z_STOOLAP_DB_P(&obj->db_zv);
-        if (db_obj->db) return 1;
+        if (DB_IS_OPEN(db_obj)) return 1;
     }
     zend_throw_exception(stoolap_exception_ce, "Database has been closed", 0);
     return 0;
@@ -1979,7 +2751,7 @@ PHP_METHOD(Stoolap_Transaction, exec)
     ZEND_PARSE_PARAMETERS_END();
 
     stoolap_tx_obj *obj = Z_STOOLAP_TX_P(ZEND_THIS);
-    if (!obj->tx) {
+    if (!obj->tx && obj->proxy_tx_id == 0) {
         zend_throw_exception(stoolap_exception_ce, "Transaction is already committed or rolled back", 0);
         RETURN_THROWS();
     }
@@ -1990,6 +2762,34 @@ PHP_METHOD(Stoolap_Transaction, exec)
     size_t clean_len;
     char *clean_sql = strip_semicolon(sql, sql_len, &clean_len);
     const char *actual_sql = clean_sql ? clean_sql : sql;
+    size_t actual_len = clean_sql ? clean_len : sql_len;
+
+    /* Proxy path */
+    stoolap_db_obj *dobj = proxy_db_from_zv(&obj->db_zv);
+    if (dobj && PROXY_ACTIVE(dobj) && obj->proxy_tx_id > 0) {
+        uint8_t *req = SHM_REQ(dobj->shm_base);
+        size_t off = 0;
+        memcpy(req + off, &obj->proxy_tx_id, 4); off += 4;
+        uint32_t slen = (uint32_t)actual_len + 1;
+        memcpy(req + off, &slen, 4); off += 4;
+        memcpy(req + off, actual_sql, actual_len);
+        req[off + actual_len] = '\0';
+        off += slen;
+        if (clean_sql) efree(clean_sql);
+        SHM_CTL(dobj->shm_base)->opcode = OP_TX_EXEC;
+        SHM_CTL(dobj->shm_base)->req_len = (uint32_t)off;
+        if (proxy_roundtrip(dobj) != 0) {
+            zend_throw_exception(stoolap_exception_ce, "daemon communication error", 0);
+            RETURN_THROWS();
+        }
+        if (SHM_CTL(dobj->shm_base)->resp_status != RESP_OK) {
+            proxy_throw_error(dobj);
+            RETURN_THROWS();
+        }
+        int64_t affected;
+        memcpy(&affected, SHM_RESP(dobj->shm_base), 8);
+        RETURN_LONG((zend_long)affected);
+    }
 
     int64_t affected = 0;
     int32_t rc = stoolap_tx_exec(obj->tx, actual_sql, &affected);
@@ -2017,7 +2817,7 @@ PHP_METHOD(Stoolap_Transaction, execute)
     ZEND_PARSE_PARAMETERS_END();
 
     stoolap_tx_obj *obj = Z_STOOLAP_TX_P(ZEND_THIS);
-    if (!obj->tx) {
+    if (!obj->tx && obj->proxy_tx_id == 0) {
         zend_throw_exception(stoolap_exception_ce, "Transaction is already committed or rolled back", 0);
         RETURN_THROWS();
     }
@@ -2039,6 +2839,7 @@ PHP_METHOD(Stoolap_Transaction, execute)
     }
 
     const char *final_sql = rewritten_sql ? rewritten_sql : actual_sql;
+    size_t final_sql_len = rewritten_sql ? strlen(rewritten_sql) : actual_len;
     zval *final_params = Z_TYPE(positional_params) != IS_UNDEF ? &positional_params : params;
 
     stoolap_params_t sp;
@@ -2048,6 +2849,44 @@ PHP_METHOD(Stoolap_Transaction, execute)
         if (Z_TYPE(positional_params) != IS_UNDEF) zval_ptr_dtor(&positional_params);
         if (clean_sql) efree(clean_sql);
         RETURN_THROWS();
+    }
+
+    /* Proxy path */
+    stoolap_db_obj *dobj = proxy_db_from_zv(&obj->db_zv);
+    if (dobj && PROXY_ACTIVE(dobj) && obj->proxy_tx_id > 0) {
+        uint8_t *req = SHM_REQ(dobj->shm_base);
+        size_t off = 0;
+        memcpy(req + off, &obj->proxy_tx_id, 4); off += 4;
+        uint32_t slen = (uint32_t)final_sql_len + 1; /* include null byte */
+        memcpy(req + off, &slen, 4); off += 4;
+        memcpy(req + off, final_sql, final_sql_len);
+        req[off + final_sql_len] = '\0';
+        off += slen;
+        uint32_t pcnt = (uint32_t)sp.count;
+        memcpy(req + off, &pcnt, 4); off += 4;
+        int32_t pw = proxy_write_params(req + off, SHM_REQ_MAX - off, sp.values, sp.count);
+        stoolap_params_free(&sp);
+        if (rewritten_sql) efree(rewritten_sql);
+        if (Z_TYPE(positional_params) != IS_UNDEF) zval_ptr_dtor(&positional_params);
+        if (clean_sql) efree(clean_sql);
+        if (pw < 0) {
+            zend_throw_exception(stoolap_exception_ce, "params too large for shared memory", 0);
+            RETURN_THROWS();
+        }
+        off += pw;
+        SHM_CTL(dobj->shm_base)->opcode = OP_TX_EXEC_PARAMS;
+        SHM_CTL(dobj->shm_base)->req_len = (uint32_t)off;
+        if (proxy_roundtrip(dobj) != 0) {
+            zend_throw_exception(stoolap_exception_ce, "daemon communication error", 0);
+            RETURN_THROWS();
+        }
+        if (SHM_CTL(dobj->shm_base)->resp_status != RESP_OK) {
+            proxy_throw_error(dobj);
+            RETURN_THROWS();
+        }
+        int64_t affected;
+        memcpy(&affected, SHM_RESP(dobj->shm_base), 8);
+        RETURN_LONG((zend_long)affected);
     }
 
     int64_t affected = 0;
@@ -2080,7 +2919,7 @@ static void stoolap_tx_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
     ZEND_PARSE_PARAMETERS_END();
 
     stoolap_tx_obj *obj = Z_STOOLAP_TX_P(ZEND_THIS);
-    if (!obj->tx) {
+    if (!obj->tx && obj->proxy_tx_id == 0) {
         zend_throw_exception(stoolap_exception_ce, "Transaction is already committed or rolled back", 0);
         RETURN_THROWS();
     }
@@ -2104,24 +2943,107 @@ static void stoolap_tx_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
         }
     }
 
-    StoolapRows *rows = NULL;
-    int32_t rc;
+    /* Named param rewrite (client-side) */
+    char *rewritten_sql = NULL;
+    zval positional_params;
+    ZVAL_UNDEF(&positional_params);
+    int has_params = (params != NULL && Z_TYPE_P(params) == IS_ARRAY && zend_hash_num_elements(Z_ARRVAL_P(params)) > 0);
 
-    if (params == NULL || Z_TYPE_P(params) != IS_ARRAY || zend_hash_num_elements(Z_ARRVAL_P(params)) == 0) {
-        rc = stoolap_tx_query(obj->tx, actual_sql, &rows);
-    } else {
-        char *rewritten_sql = NULL;
-        zval positional_params;
-        ZVAL_UNDEF(&positional_params);
+    if (has_params) {
         if (rewrite_named_params_full(actual_sql, actual_len, params, &rewritten_sql, &positional_params) != SUCCESS) {
             if (limited_sql) efree(limited_sql);
             if (clean_sql) efree(clean_sql);
             RETURN_THROWS();
         }
+    }
 
-        const char *final_sql = rewritten_sql ? rewritten_sql : actual_sql;
-        zval *final_params = Z_TYPE(positional_params) != IS_UNDEF ? &positional_params : params;
+    const char *final_sql = rewritten_sql ? rewritten_sql : actual_sql;
+    size_t final_sql_len = rewritten_sql ? strlen(rewritten_sql) : actual_len;
+    zval *final_params = Z_TYPE(positional_params) != IS_UNDEF ? &positional_params : params;
 
+    /* Proxy path */
+    stoolap_db_obj *dobj = proxy_db_from_zv(&obj->db_zv);
+    if (dobj && PROXY_ACTIVE(dobj) && obj->proxy_tx_id > 0) {
+        uint8_t *req = SHM_REQ(dobj->shm_base);
+        size_t off = 0;
+        memcpy(req + off, &obj->proxy_tx_id, 4); off += 4;
+        uint32_t slen = (uint32_t)final_sql_len + 1;
+        memcpy(req + off, &slen, 4); off += 4;
+        memcpy(req + off, final_sql, final_sql_len);
+        req[off + final_sql_len] = '\0';
+        off += slen;
+
+        uint8_t opcode;
+        if (has_params) {
+            stoolap_params_t sp;
+            if (stoolap_build_params(final_params, &sp) != SUCCESS) {
+                stoolap_params_free(&sp);
+                if (rewritten_sql) efree(rewritten_sql);
+                if (Z_TYPE(positional_params) != IS_UNDEF) zval_ptr_dtor(&positional_params);
+                if (limited_sql) efree(limited_sql);
+                if (clean_sql) efree(clean_sql);
+                RETURN_THROWS();
+            }
+            uint32_t pcnt = (uint32_t)sp.count;
+            memcpy(req + off, &pcnt, 4); off += 4;
+            int32_t pw = proxy_write_params(req + off, SHM_REQ_MAX - off, sp.values, sp.count);
+            stoolap_params_free(&sp);
+            if (pw < 0) {
+                if (rewritten_sql) efree(rewritten_sql);
+                if (Z_TYPE(positional_params) != IS_UNDEF) zval_ptr_dtor(&positional_params);
+                if (limited_sql) efree(limited_sql);
+                if (clean_sql) efree(clean_sql);
+                zend_throw_exception(stoolap_exception_ce, "params too large for shared memory", 0);
+                RETURN_THROWS();
+            }
+            off += pw;
+            opcode = OP_TX_QUERY_PARAMS;
+        } else {
+            opcode = OP_TX_QUERY;
+        }
+
+        if (rewritten_sql) efree(rewritten_sql);
+        if (Z_TYPE(positional_params) != IS_UNDEF) zval_ptr_dtor(&positional_params);
+        if (limited_sql) efree(limited_sql);
+        if (clean_sql) efree(clean_sql);
+
+        SHM_CTL(dobj->shm_base)->opcode = opcode;
+        SHM_CTL(dobj->shm_base)->req_len = (uint32_t)off;
+        if (proxy_roundtrip(dobj) != 0) {
+            zend_throw_exception(stoolap_exception_ce, "daemon communication error", 0);
+            RETURN_THROWS();
+        }
+        if (SHM_CTL(dobj->shm_base)->resp_status != RESP_OK) {
+            proxy_throw_error(dobj);
+            RETURN_THROWS();
+        }
+        uint8_t *resp = SHM_RESP(dobj->shm_base);
+        uint32_t buf_len = SHM_CTL(dobj->shm_base)->resp_len;
+        if (buf_len > 0) {
+            if (mode == QUERY_RAW) {
+                parse_buffer_raw(resp, buf_len, return_value);
+            } else if (mode == QUERY_ONE) {
+                parse_buffer_one(resp, buf_len, return_value);
+            } else {
+                parse_buffer_assoc(resp, buf_len, return_value);
+            }
+        } else {
+            if (mode == QUERY_ONE) {
+                ZVAL_NULL(return_value);
+            } else {
+                array_init(return_value);
+            }
+        }
+        return;
+    }
+
+    /* Direct mode */
+    StoolapRows *rows = NULL;
+    int32_t rc;
+
+    if (!has_params) {
+        rc = stoolap_tx_query(obj->tx, actual_sql, &rows);
+    } else {
         stoolap_params_t sp;
         if (stoolap_build_params(final_params, &sp) != SUCCESS) {
             stoolap_params_free(&sp);
@@ -2135,10 +3057,10 @@ static void stoolap_tx_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
         rc = stoolap_tx_query_params(obj->tx, final_sql, sp.values, sp.count, &rows);
 
         stoolap_params_free(&sp);
-        if (rewritten_sql) efree(rewritten_sql);
-        if (Z_TYPE(positional_params) != IS_UNDEF) zval_ptr_dtor(&positional_params);
     }
 
+    if (rewritten_sql) efree(rewritten_sql);
+    if (Z_TYPE(positional_params) != IS_UNDEF) zval_ptr_dtor(&positional_params);
     if (limited_sql) efree(limited_sql);
     if (clean_sql) efree(clean_sql);
 
@@ -2167,7 +3089,7 @@ PHP_METHOD(Stoolap_Transaction, executeBatch)
     ZEND_PARSE_PARAMETERS_END();
 
     stoolap_tx_obj *obj = Z_STOOLAP_TX_P(ZEND_THIS);
-    if (!obj->tx) {
+    if (!obj->tx && obj->proxy_tx_id == 0) {
         zend_throw_exception(stoolap_exception_ce, "Transaction is already committed or rolled back", 0);
         RETURN_THROWS();
     }
@@ -2177,7 +3099,6 @@ PHP_METHOD(Stoolap_Transaction, executeBatch)
 
     /* Resolve DB handle for stoolap_prepare */
     stoolap_db_obj *db_obj = Z_STOOLAP_DB_P(&obj->db_zv);
-    StoolapDB *db = db_obj->db;
 
     HashTable *outer = Z_ARRVAL_P(params_array);
     uint32_t batch_len = zend_hash_num_elements(outer);
@@ -2199,7 +3120,134 @@ PHP_METHOD(Stoolap_Transaction, executeBatch)
         if (clean_sql) efree(clean_sql);
         clean_sql = rewritten_sql;
         final_sql = clean_sql;
+        final_sql_len = strlen(clean_sql);
     }
+
+    /* Determine param count from first row */
+    zval *first_row_tx;
+    ZEND_HASH_FOREACH_VAL(outer, first_row_tx) { break; } ZEND_HASH_FOREACH_END();
+    int32_t params_per_row;
+    if (Z_TYPE_P(first_row_tx) != IS_ARRAY) {
+        params_per_row = 0;
+    } else if (param_names && !zval_array_is_list(first_row_tx)) {
+        params_per_row = (int32_t)param_name_count;
+    } else if (Z_TYPE_P(first_row_tx) == IS_ARRAY && !zval_array_is_list(first_row_tx) && !param_names) {
+        if (clean_sql) efree(clean_sql);
+        zend_throw_exception(stoolap_exception_ce,
+            "Associative array parameters require named placeholders (:name) in SQL; "
+            "use a sequential array for positional ($1, $2, ...) placeholders", 0);
+        RETURN_THROWS();
+    } else {
+        params_per_row = (int32_t)zend_hash_num_elements(Z_ARRVAL_P(first_row_tx));
+    }
+
+    /* Proxy path for TX executeBatch: pre-allocate once, serialize all rows */
+    if (PROXY_ACTIVE(db_obj) && obj->proxy_tx_id > 0) {
+        uint8_t *req = SHM_REQ(db_obj->shm_base);
+        size_t off = 0;
+        memcpy(req + off, &obj->proxy_tx_id, 4); off += 4;
+        uint32_t slen = (uint32_t)final_sql_len + 1;
+        memcpy(req + off, &slen, 4); off += 4;
+        memcpy(req + off, final_sql, final_sql_len);
+        req[off + final_sql_len] = '\0';
+        off += slen;
+        uint32_t ppr = (uint32_t)params_per_row;
+        memcpy(req + off, &ppr, 4); off += 4;
+        uint32_t bcnt = batch_len;
+        memcpy(req + off, &bcnt, 4); off += 4;
+
+        /* Pre-allocate param arrays once (reused per row) */
+        StoolapValue *batch_values = emalloc(params_per_row * sizeof(StoolapValue));
+        int batch_json_alloc = params_per_row;
+        zend_string **batch_json_strs = emalloc(batch_json_alloc * sizeof(zend_string *));
+        int batch_json_count = 0;
+
+        zval *row;
+        ZEND_HASH_FOREACH_VAL(outer, row) {
+            if (Z_TYPE_P(row) != IS_ARRAY) {
+                stoolap_batch_json_free(batch_json_strs, &batch_json_count);
+                efree(batch_values); efree(batch_json_strs);
+                if (param_names) {
+                    for (uint32_t i = 0; i < param_name_count; i++) zend_string_release(param_names[i]);
+                    efree(param_names);
+                }
+                if (clean_sql) efree(clean_sql);
+                zend_throw_exception(stoolap_exception_ce, "executeBatch: each element must be an array", 0);
+                RETURN_THROWS();
+            }
+            zval positional;
+            ZVAL_UNDEF(&positional);
+            zval *fill_row = row;
+            if (param_names && !zval_array_is_list(row)) {
+                if (reorder_named_params(row, param_names, param_name_count, &positional) != SUCCESS) {
+                    stoolap_batch_json_free(batch_json_strs, &batch_json_count);
+                    efree(batch_values); efree(batch_json_strs);
+                    if (param_names) {
+                        for (uint32_t i = 0; i < param_name_count; i++) zend_string_release(param_names[i]);
+                        efree(param_names);
+                    }
+                    if (clean_sql) efree(clean_sql);
+                    RETURN_THROWS();
+                }
+                fill_row = &positional;
+            }
+            int fill_rc = stoolap_batch_fill_params(fill_row, batch_values, params_per_row,
+                                                     batch_json_strs, &batch_json_count, batch_json_alloc);
+            if (Z_TYPE(positional) != IS_UNDEF) zval_ptr_dtor(&positional);
+            if (fill_rc != SUCCESS) {
+                stoolap_batch_json_free(batch_json_strs, &batch_json_count);
+                efree(batch_values); efree(batch_json_strs);
+                if (param_names) {
+                    for (uint32_t i = 0; i < param_name_count; i++) zend_string_release(param_names[i]);
+                    efree(param_names);
+                }
+                if (clean_sql) efree(clean_sql);
+                if (!EG(exception)) {
+                    zend_throw_exception(stoolap_exception_ce,
+                        "executeBatch: parameter count mismatch (all rows must have the same number of parameters)", 0);
+                }
+                RETURN_THROWS();
+            }
+            int32_t pw = proxy_write_params(req + off, SHM_REQ_MAX - off, batch_values, params_per_row);
+            stoolap_batch_json_free(batch_json_strs, &batch_json_count);
+            if (pw < 0) {
+                efree(batch_values); efree(batch_json_strs);
+                if (param_names) {
+                    for (uint32_t i = 0; i < param_name_count; i++) zend_string_release(param_names[i]);
+                    efree(param_names);
+                }
+                if (clean_sql) efree(clean_sql);
+                zend_throw_exception(stoolap_exception_ce, "batch params too large for shared memory", 0);
+                RETURN_THROWS();
+            }
+            off += pw;
+        } ZEND_HASH_FOREACH_END();
+
+        efree(batch_values);
+        efree(batch_json_strs);
+
+        if (param_names) {
+            for (uint32_t i = 0; i < param_name_count; i++) zend_string_release(param_names[i]);
+            efree(param_names);
+        }
+        if (clean_sql) efree(clean_sql);
+
+        SHM_CTL(db_obj->shm_base)->opcode = OP_TX_EXEC_BATCH;
+        SHM_CTL(db_obj->shm_base)->req_len = (uint32_t)off;
+        if (proxy_roundtrip(db_obj) != 0) {
+            zend_throw_exception(stoolap_exception_ce, "daemon communication error", 0);
+            RETURN_THROWS();
+        }
+        if (SHM_CTL(db_obj->shm_base)->resp_status != RESP_OK) {
+            proxy_throw_error(db_obj);
+            RETURN_THROWS();
+        }
+        int64_t affected;
+        memcpy(&affected, SHM_RESP(db_obj->shm_base), 8);
+        RETURN_LONG((zend_long)affected);
+    }
+
+    StoolapDB *db = db_obj->db;
 
     /* Determine param count from first row and pre-allocate ONCE */
     zval *first_row;
@@ -2332,12 +3380,31 @@ PHP_METHOD(Stoolap_Transaction, commit)
     ZEND_PARSE_PARAMETERS_NONE();
 
     stoolap_tx_obj *obj = Z_STOOLAP_TX_P(ZEND_THIS);
-    if (!obj->tx) {
+    if (!obj->tx && obj->proxy_tx_id == 0) {
         zend_throw_exception(stoolap_exception_ce, "Transaction is already committed or rolled back", 0);
         RETURN_THROWS();
     }
     if (!stoolap_tx_check_db(obj)) {
         RETURN_THROWS();
+    }
+
+    /* Proxy path */
+    stoolap_db_obj *dobj = proxy_db_from_zv(&obj->db_zv);
+    if (dobj && PROXY_ACTIVE(dobj) && obj->proxy_tx_id > 0) {
+        uint8_t *req = SHM_REQ(dobj->shm_base);
+        memcpy(req, &obj->proxy_tx_id, 4);
+        SHM_CTL(dobj->shm_base)->opcode = OP_TX_COMMIT;
+        SHM_CTL(dobj->shm_base)->req_len = 4;
+        obj->proxy_tx_id = 0; /* consumed */
+        if (proxy_roundtrip(dobj) != 0) {
+            zend_throw_exception(stoolap_exception_ce, "daemon communication error", 0);
+            RETURN_THROWS();
+        }
+        if (SHM_CTL(dobj->shm_base)->resp_status != RESP_OK) {
+            proxy_throw_error(dobj);
+            RETURN_THROWS();
+        }
+        return;
     }
 
     StoolapTx *tx = obj->tx;
@@ -2357,12 +3424,31 @@ PHP_METHOD(Stoolap_Transaction, rollback)
     ZEND_PARSE_PARAMETERS_NONE();
 
     stoolap_tx_obj *obj = Z_STOOLAP_TX_P(ZEND_THIS);
-    if (!obj->tx) {
+    if (!obj->tx && obj->proxy_tx_id == 0) {
         zend_throw_exception(stoolap_exception_ce, "Transaction is already committed or rolled back", 0);
         RETURN_THROWS();
     }
     if (!stoolap_tx_check_db(obj)) {
         RETURN_THROWS();
+    }
+
+    /* Proxy path */
+    stoolap_db_obj *dobj = proxy_db_from_zv(&obj->db_zv);
+    if (dobj && PROXY_ACTIVE(dobj) && obj->proxy_tx_id > 0) {
+        uint8_t *req = SHM_REQ(dobj->shm_base);
+        memcpy(req, &obj->proxy_tx_id, 4);
+        SHM_CTL(dobj->shm_base)->opcode = OP_TX_ROLLBACK;
+        SHM_CTL(dobj->shm_base)->req_len = 4;
+        obj->proxy_tx_id = 0; /* consumed */
+        if (proxy_roundtrip(dobj) != 0) {
+            zend_throw_exception(stoolap_exception_ce, "daemon communication error", 0);
+            RETURN_THROWS();
+        }
+        if (SHM_CTL(dobj->shm_base)->resp_status != RESP_OK) {
+            proxy_throw_error(dobj);
+            RETURN_THROWS();
+        }
+        return;
     }
 
     StoolapTx *tx = obj->tx;
@@ -2523,6 +3609,19 @@ static const zend_function_entry stoolap_transaction_methods[] = {
 
 PHP_MINIT_FUNCTION(stoolap)
 {
+    /* Save argv[0] pointer for daemon process title */
+#if defined(__APPLE__)
+    extern char ***_NSGetArgv(void);
+    char ***argvp = _NSGetArgv();
+    if (argvp && *argvp && **argvp) {
+        stoolap_save_argv0(**argvp);
+    }
+#elif defined(__linux__)
+    if (SG(request_info).argc > 0 && SG(request_info).argv) {
+        stoolap_save_argv0(SG(request_info).argv[0]);
+    }
+#endif
+
     zend_class_entry ce;
 
     /* StoolapException */
@@ -2564,17 +3663,29 @@ PHP_MINIT_FUNCTION(stoolap)
 
     datetime_interface_ce = NULL;
 
+    /* In fpm/cgi mode, start the daemon from the master process (before worker fork).
+     * Workers will connect to it via shm+futex/ulock IPC.
+     * Socket path is per-fpm-master-pid for isolation between instances. */
+    if (stoolap_use_daemon()) {
+        pid_t master = getpid();
+        stoolap_daemon_init_paths(master);
+        stoolap_daemon_set_parent(master);
+        ensure_daemon_running();
+    }
+
     return SUCCESS;
 }
 
 PHP_RINIT_FUNCTION(stoolap)
 {
-    /* Resolve DateTimeInterface once per request (not available during MINIT) */
-    if (!datetime_interface_ce) {
-        datetime_interface_ce = zend_lookup_class(
-            zend_string_init_interned("DateTimeInterface", sizeof("DateTimeInterface") - 1, 0));
-    }
+    return SUCCESS;
+}
 
+PHP_MSHUTDOWN_FUNCTION(stoolap)
+{
+    /* When fpm master exits, remove the daemon socket file.
+     * The daemon polls for this and will shut down cleanly. */
+    unlink(STOOLAP_DAEMON_SOCK);
     return SUCCESS;
 }
 
@@ -2595,7 +3706,7 @@ zend_module_entry stoolap_module_entry = {
     "stoolap",
     NULL,                   /* functions */
     PHP_MINIT(stoolap),
-    NULL,                   /* MSHUTDOWN */
+    PHP_MSHUTDOWN(stoolap),
     PHP_RINIT(stoolap),
     NULL,                   /* RSHUTDOWN */
     PHP_MINFO(stoolap),

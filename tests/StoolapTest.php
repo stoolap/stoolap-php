@@ -16,7 +16,7 @@ class StoolapTest extends TestCase
 
     protected function setUp(): void
     {
-        $this->db = Database::open('memory://');
+        $this->db = Database::open('memory://test_' . getmypid() . '_' . mt_rand());
     }
 
     protected function tearDown(): void
@@ -1025,9 +1025,9 @@ class StoolapTest extends TestCase
     public function testOpenWithColonMemory(): void
     {
         $db = Database::open(':memory:');
-        $db->exec('CREATE TABLE t (id INTEGER)');
-        $db->exec('INSERT INTO t VALUES (1)');
-        $rows = $db->query('SELECT * FROM t');
+        $db->exec('CREATE TABLE dsn_colon_test (id INTEGER)');
+        $db->exec('INSERT INTO dsn_colon_test VALUES (1)');
+        $rows = $db->query('SELECT * FROM dsn_colon_test');
         $this->assertCount(1, $rows);
         $db->close();
     }
@@ -1035,8 +1035,8 @@ class StoolapTest extends TestCase
     public function testOpenWithEmptyString(): void
     {
         $db = Database::open('');
-        $db->exec('CREATE TABLE t (id INTEGER)');
-        $rows = $db->query('SELECT * FROM t');
+        $db->exec('CREATE TABLE dsn_empty_test (id INTEGER)');
+        $rows = $db->query('SELECT * FROM dsn_empty_test');
         $this->assertSame([], $rows);
         $db->close();
     }

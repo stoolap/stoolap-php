@@ -35,10 +35,8 @@ if test "$PHP_STOOLAP" != "no"; then
 
   PHP_ADD_LIBRARY_WITH_PATH(stoolap, $STOOLAP_LIB_DIR, STOOLAP_SHARED_LIBADD)
   PHP_SUBST(STOOLAP_SHARED_LIBADD)
+  STOOLAP_SHARED_LIBADD="$STOOLAP_SHARED_LIBADD -Wl,-rpath,$STOOLAP_LIB_DIR -lpthread"
 
-  dnl Add rpath so library is found at runtime
-  STOOLAP_SHARED_LIBADD="$STOOLAP_SHARED_LIBADD -Wl,-rpath,$STOOLAP_LIB_DIR"
-
-  PHP_NEW_EXTENSION(stoolap, stoolap.c, $ext_shared)
+  PHP_NEW_EXTENSION(stoolap, stoolap.c stoolap_daemon.c, $ext_shared)
   PHP_ADD_MAKEFILE_FRAGMENT
 fi
