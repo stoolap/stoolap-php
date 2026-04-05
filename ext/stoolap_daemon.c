@@ -1774,9 +1774,6 @@ static void sigterm_handler(int sig)
 
 static int create_listen_socket(void)
 {
-    /* Remove stale socket file */
-    unlink(STOOLAP_DAEMON_SOCK);
-
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
         LOG_ERR("socket() failed: %s", strerror(errno));
@@ -1789,6 +1786,11 @@ static int create_listen_socket(void)
     strncpy(addr.sun_path, STOOLAP_DAEMON_SOCK, sizeof(addr.sun_path) - 1);
 
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        if (errno == EADDRINUSE) {
+            /* Another daemon won the race — exit silently */
+            close(fd);
+            return -2; /* special: not an error, just lost the race */
+        }
         LOG_ERR("bind(%s) failed: %s", STOOLAP_DAEMON_SOCK, strerror(errno));
         close(fd);
         return -1;
@@ -1907,8 +1909,12 @@ void stoolap_daemon_run(char *argv0_unused, size_t argv0_unused_len)
     set_nonblocking(g_self_pipe[0]);
     set_nonblocking(g_self_pipe[1]);
 
-    /* Create listen socket */
+    /* Create listen socket — bind() is the atomic lock.
+     * If another daemon already bound, we get -2 and exit silently. */
     int listen_fd = create_listen_socket();
+    if (listen_fd == -2) {
+        _exit(0); /* another daemon won the race */
+    }
     if (listen_fd < 0) {
         _exit(1);
     }

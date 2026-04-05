@@ -1246,47 +1246,31 @@ static int ensure_daemon_running(void)
         stoolap_daemon_init_paths((parent > 1) ? parent : getpid());
     }
 
-    /* Check if daemon is already running by probing the socket */
+    /* Probe socket with connect() to verify daemon is alive.
+     * stat() alone can't distinguish a live socket from a stale one. */
     struct stat st;
     if (stat(STOOLAP_DAEMON_SOCK, &st) == 0 && S_ISSOCK(st.st_mode)) {
-        return 0;
-    }
-
-    /* Try to become the forker using an atomic lock file.
-     * With php_admin_value[extension], MINIT runs in each worker —
-     * multiple workers race to fork the daemon. The lock serializes them. */
-    char lock_path[80];
-    snprintf(lock_path, sizeof(lock_path), "%s.lock", STOOLAP_DAEMON_SOCK);
-    int lock_fd = open(lock_path, O_CREAT | O_RDWR, 0600);
-    if (lock_fd >= 0) {
-        if (flock(lock_fd, LOCK_EX | LOCK_NB) != 0) {
-            /* Another worker is forking — wait for socket to appear */
-            close(lock_fd);
-            for (int i = 0; i < 40; i++) {
-                usleep(50000);
-                if (stat(STOOLAP_DAEMON_SOCK, &st) == 0 && S_ISSOCK(st.st_mode)) {
-                    unlink(lock_path);
-                    return 0;
-                }
+        int probe = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (probe >= 0) {
+            struct sockaddr_un addr;
+            memset(&addr, 0, sizeof(addr));
+            addr.sun_family = AF_UNIX;
+            strncpy(addr.sun_path, STOOLAP_DAEMON_SOCK, sizeof(addr.sun_path) - 1);
+            if (connect(probe, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+                close(probe);
+                return 0; /* daemon is alive */
             }
-            unlink(lock_path);
-            return -1;
-        }
-        /* We hold the lock — double-check socket didn't appear */
-        if (stat(STOOLAP_DAEMON_SOCK, &st) == 0 && S_ISSOCK(st.st_mode)) {
-            flock(lock_fd, LOCK_UN);
-            close(lock_fd);
-            unlink(lock_path);
-            return 0;
+            close(probe);
+            /* Stale socket from crashed daemon — remove so bind() can succeed */
+            unlink(STOOLAP_DAEMON_SOCK);
         }
     }
 
-    /* Double-fork to avoid zombie */
+    /* Double-fork a daemon candidate. If multiple processes race here,
+     * each forks a candidate — but only one can bind() the socket.
+     * Losers get EADDRINUSE and _exit(0) silently. No lock file needed. */
     pid_t pid = fork();
-    if (pid < 0) {
-        if (lock_fd >= 0) { flock(lock_fd, LOCK_UN); close(lock_fd); }
-        return -1;
-    }
+    if (pid < 0) return -1;
     if (pid == 0) {
         pid_t daemon_pid = fork();
         if (daemon_pid == 0) {
@@ -1302,7 +1286,7 @@ static int ensure_daemon_running(void)
                     close(devnull);
                 }
             }
-            stoolap_daemon_run(NULL, 0);
+            stoolap_daemon_run(NULL, 0); /* bind() decides the winner */
             _exit(0);
         }
         _exit(0);
@@ -1310,15 +1294,13 @@ static int ensure_daemon_running(void)
 
     waitpid(pid, NULL, 0);
 
-    /* Wait for daemon to create socket */
-    for (int i = 0; i < 40; i++) {
+    /* Wait for the winning daemon to create the socket */
+    for (int i = 0; i < 40; i++) { /* 40 * 50ms = 2s max */
         usleep(50000);
         if (stat(STOOLAP_DAEMON_SOCK, &st) == 0 && S_ISSOCK(st.st_mode)) {
-            if (lock_fd >= 0) { flock(lock_fd, LOCK_UN); close(lock_fd); unlink(lock_path); }
             return 0;
         }
     }
-    if (lock_fd >= 0) { flock(lock_fd, LOCK_UN); close(lock_fd); unlink(lock_path); }
     return -1;
 }
 
