@@ -1246,31 +1246,15 @@ static int ensure_daemon_running(void)
         stoolap_daemon_init_paths((parent > 1) ? parent : getpid());
     }
 
-    /* Probe socket with connect() to verify daemon is alive.
-     * stat() alone can't distinguish a live socket from a stale one. */
+    /* Fast path: socket file exists → assume daemon is running.
+     * If it's stale (crashed daemon), proxy_connect() will fail and
+     * Database::open() falls through to direct mode. On next call,
+     * the daemon's bind() will clean up via EADDRINUSE detection.
+     * We don't probe with connect() because that creates a real
+     * connection the daemon must accept and handle. */
     struct stat st;
     if (stat(STOOLAP_DAEMON_SOCK, &st) == 0 && S_ISSOCK(st.st_mode)) {
-        int probe = socket(AF_UNIX, SOCK_STREAM, 0);
-        if (probe >= 0) {
-            struct sockaddr_un addr;
-            memset(&addr, 0, sizeof(addr));
-            addr.sun_family = AF_UNIX;
-            strncpy(addr.sun_path, STOOLAP_DAEMON_SOCK, sizeof(addr.sun_path) - 1);
-            if (connect(probe, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
-                close(probe);
-                return 0; /* daemon is alive */
-            }
-            int err = errno;
-            close(probe);
-            if (err == ECONNREFUSED) {
-                /* No listener — stale socket from crashed daemon */
-                unlink(STOOLAP_DAEMON_SOCK);
-            } else {
-                /* Other error (EAGAIN, EACCES, etc.) — daemon may be alive
-                 * but busy or inaccessible. Don't unlink. Let bind() decide. */
-                return 0;
-            }
-        }
+        return 0;
     }
 
     /* Double-fork a daemon candidate. If multiple processes race here,

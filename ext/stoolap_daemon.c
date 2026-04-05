@@ -1787,14 +1787,34 @@ static int create_listen_socket(void)
 
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         if (errno == EADDRINUSE) {
-            /* Another daemon won the race — exit silently */
+            /* Socket exists. Probe to see if a daemon is actually listening.
+             * If ECONNREFUSED → stale socket from crash, unlink and retry.
+             * If connect succeeds → live daemon, we lost the race. */
+            int probe = socket(AF_UNIX, SOCK_STREAM, 0);
+            if (probe >= 0) {
+                if (connect(probe, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+                    close(probe); /* live daemon — we're the loser */
+                    close(fd);
+                    return -2;
+                }
+                int err = errno;
+                close(probe);
+                if (err == ECONNREFUSED) {
+                    /* Stale socket — unlink and retry bind once */
+                    unlink(STOOLAP_DAEMON_SOCK);
+                    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+                        goto bind_ok;
+                    }
+                }
+            }
             close(fd);
-            return -2; /* special: not an error, just lost the race */
+            return -2; /* give up — another daemon likely won the retry */
         }
         LOG_ERR("bind(%s) failed: %s", STOOLAP_DAEMON_SOCK, strerror(errno));
         close(fd);
         return -1;
     }
+bind_ok:
 
     if (listen(fd, 16) < 0) {
         LOG_ERR("listen() failed: %s", strerror(errno));
