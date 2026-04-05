@@ -1242,26 +1242,54 @@ static int ensure_daemon_running(void)
 {
     /* Lazy init paths if not already done (CLI with STOOLAP_DAEMON=1) */
     if (g_daemon_sock[0] == '\0') {
-        stoolap_daemon_init_paths(getpid());
+        pid_t parent = getppid();
+        stoolap_daemon_init_paths((parent > 1) ? parent : getpid());
     }
 
-    /* Check if daemon socket exists (avoids spurious fork) */
+    /* Check if daemon is already running by probing the socket */
     struct stat st;
     if (stat(STOOLAP_DAEMON_SOCK, &st) == 0 && S_ISSOCK(st.st_mode)) {
-        return 0; /* socket exists, daemon likely running */
+        return 0;
     }
 
-    /* Double-fork to avoid zombie: fork → intermediate → fork → daemon.
-     * Intermediate exits immediately, parent waitpid's it.
-     * Daemon is reparented to init/launchd — no zombie.
-     * No lock needed — socket path is per-PID, only we fork this daemon. */
+    /* Try to become the forker using an atomic lock file.
+     * With php_admin_value[extension], MINIT runs in each worker —
+     * multiple workers race to fork the daemon. The lock serializes them. */
+    char lock_path[80];
+    snprintf(lock_path, sizeof(lock_path), "%s.lock", STOOLAP_DAEMON_SOCK);
+    int lock_fd = open(lock_path, O_CREAT | O_RDWR, 0600);
+    if (lock_fd >= 0) {
+        if (flock(lock_fd, LOCK_EX | LOCK_NB) != 0) {
+            /* Another worker is forking — wait for socket to appear */
+            close(lock_fd);
+            for (int i = 0; i < 40; i++) {
+                usleep(50000);
+                if (stat(STOOLAP_DAEMON_SOCK, &st) == 0 && S_ISSOCK(st.st_mode)) {
+                    unlink(lock_path);
+                    return 0;
+                }
+            }
+            unlink(lock_path);
+            return -1;
+        }
+        /* We hold the lock — double-check socket didn't appear */
+        if (stat(STOOLAP_DAEMON_SOCK, &st) == 0 && S_ISSOCK(st.st_mode)) {
+            flock(lock_fd, LOCK_UN);
+            close(lock_fd);
+            unlink(lock_path);
+            return 0;
+        }
+    }
+
+    /* Double-fork to avoid zombie */
     pid_t pid = fork();
-    if (pid < 0) return -1;
+    if (pid < 0) {
+        if (lock_fd >= 0) { flock(lock_fd, LOCK_UN); close(lock_fd); }
+        return -1;
+    }
     if (pid == 0) {
-        /* Intermediate process */
         pid_t daemon_pid = fork();
         if (daemon_pid == 0) {
-            /* Daemon process */
             int max_fd = (int)sysconf(_SC_OPEN_MAX);
             if (max_fd < 0) max_fd = 1024;
             for (int i = 3; i < max_fd; i++) close(i);
@@ -1274,22 +1302,24 @@ static int ensure_daemon_running(void)
                     close(devnull);
                 }
             }
-            stoolap_daemon_run(NULL, 0); /* never returns */
+            stoolap_daemon_run(NULL, 0);
             _exit(0);
         }
         _exit(0);
     }
 
-    /* Parent: wait for intermediate (instant, no zombie) */
     waitpid(pid, NULL, 0);
 
-    for (int i = 0; i < 40; i++) { /* 40 * 50ms = 2s max */
+    /* Wait for daemon to create socket */
+    for (int i = 0; i < 40; i++) {
         usleep(50000);
         if (stat(STOOLAP_DAEMON_SOCK, &st) == 0 && S_ISSOCK(st.st_mode)) {
+            if (lock_fd >= 0) { flock(lock_fd, LOCK_UN); close(lock_fd); unlink(lock_path); }
             return 0;
         }
     }
-    return -1; /* daemon failed to start */
+    if (lock_fd >= 0) { flock(lock_fd, LOCK_UN); close(lock_fd); unlink(lock_path); }
+    return -1;
 }
 
 /* Serialize StoolapValue params into shm request buffer.
@@ -3663,13 +3693,28 @@ PHP_MINIT_FUNCTION(stoolap)
 
     datetime_interface_ce = NULL;
 
-    /* In fpm/cgi mode, start the daemon from the master process (before worker fork).
-     * Workers will connect to it via shm+futex/ulock IPC.
-     * Socket path is per-fpm-master-pid for isolation between instances. */
+    /* In fpm/cgi mode, start the daemon.
+     * Socket path uses fpm master PID for isolation between instances.
+     *
+     * MINIT can run in the master (extension in php.ini) or per-worker
+     * (extension via php_admin_value). Use getppid() when our parent
+     * is the fpm master, getpid() when WE are the master. Detect by
+     * checking if parent is also an fpm process. */
     if (stoolap_use_daemon()) {
-        pid_t master = getpid();
-        stoolap_daemon_init_paths(master);
-        stoolap_daemon_set_parent(master);
+        /* If loaded per-worker (php_admin_value[extension]), all workers
+         * share the parent (fpm master) PID as the socket key.
+         * If loaded globally (php.ini), MINIT runs in the master itself. */
+        pid_t my_pid = getpid();
+        pid_t parent_pid = getppid();
+
+        /* Use parent PID if our parent is the fpm master (not init/launchd).
+         * This handles both loading modes:
+         * - Global load: MINIT in master, getppid() = terminal/init → use getpid()
+         * - Per-pool load: MINIT in worker, getppid() = fpm master → use getppid() */
+        pid_t daemon_owner = (parent_pid > 1) ? parent_pid : my_pid;
+
+        stoolap_daemon_init_paths(daemon_owner);
+        stoolap_daemon_set_parent(daemon_owner);
         ensure_daemon_running();
     }
 
