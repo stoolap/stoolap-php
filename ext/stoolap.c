@@ -1260,9 +1260,16 @@ static int ensure_daemon_running(void)
                 close(probe);
                 return 0; /* daemon is alive */
             }
+            int err = errno;
             close(probe);
-            /* Stale socket from crashed daemon — remove so bind() can succeed */
-            unlink(STOOLAP_DAEMON_SOCK);
+            if (err == ECONNREFUSED) {
+                /* No listener — stale socket from crashed daemon */
+                unlink(STOOLAP_DAEMON_SOCK);
+            } else {
+                /* Other error (EAGAIN, EACCES, etc.) — daemon may be alive
+                 * but busy or inaccessible. Don't unlink. Let bind() decide. */
+                return 0;
+            }
         }
     }
 
