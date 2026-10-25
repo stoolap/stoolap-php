@@ -1879,4 +1879,144 @@ class StoolapTest extends TestCase
         $this->assertNotNull($row);
         $this->assertSame(1, $row['id']);
     }
+
+    // ---- 0.5.0: cached result shapes, one-call queries ----
+
+    public function testResultShapeFollowsColumnChangesOnSameConnection(): void
+    {
+        $this->db->exec('CREATE TABLE sh1 (id INTEGER PRIMARY KEY, a TEXT, b INTEGER)');
+        $this->db->execute('INSERT INTO sh1 VALUES ($1, $2, $3)', [1, 'x', 10]);
+
+        // Database and Transaction queries share one cached shape; it must
+        // be rebuilt whenever the column list changes.
+        $this->assertSame([['a' => 'x']], $this->db->query('SELECT a FROM sh1'));
+        $this->assertSame([['b' => 10, 'id' => 1]], $this->db->query('SELECT b, id FROM sh1'));
+        $this->assertSame([['b' => 10]], $this->db->query('SELECT b FROM sh1'));
+        $this->assertSame([['a' => 'x']], $this->db->query('SELECT a FROM sh1'));
+        $tx = $this->db->begin();
+        $this->assertSame(['id' => 1, 'a' => 'x'], $tx->queryOne('SELECT id, a FROM sh1'));
+        $tx->rollback();
+        $this->assertSame(['a' => 'x'], $this->db->queryOne('SELECT a FROM sh1'));
+    }
+
+    public function testPreparedStatementSeesColumnAddedAfterPrepare(): void
+    {
+        $this->db->exec('CREATE TABLE sh2 (id INTEGER PRIMARY KEY, a TEXT)');
+        $this->db->execute('INSERT INTO sh2 VALUES ($1, $2)', [1, 'x']);
+        $stmt = $this->db->prepare('SELECT * FROM sh2');
+        $this->assertSame([['id' => 1, 'a' => 'x']], $stmt->query());
+
+        $this->db->exec('ALTER TABLE sh2 ADD COLUMN b INTEGER');
+        $this->db->execute('UPDATE sh2 SET b = $1', [7]);
+        $this->assertSame([['id' => 1, 'a' => 'x', 'b' => 7]], $stmt->query());
+        $this->assertSame(['id' => 1, 'a' => 'x', 'b' => 7], $stmt->queryOne());
+    }
+
+    public function testDuplicateColumnNamesLastValueWins(): void
+    {
+        $this->db->exec('CREATE TABLE sh3 (id INTEGER PRIMARY KEY, a TEXT)');
+        $this->db->execute('INSERT INTO sh3 VALUES ($1, $2)', [1, 'x']);
+        $this->assertSame([['id' => 'x']], $this->db->query('SELECT id, a AS id FROM sh3'));
+        $raw = $this->db->queryRaw('SELECT id, a AS id FROM sh3');
+        $this->assertSame(['id', 'id'], $raw['columns']);
+        $this->assertSame([[1, 'x']], $raw['rows']);
+    }
+
+    public function testNumericColumnNamesBecomeIntegerKeys(): void
+    {
+        $this->assertSame([[0 => 1, 1 => 2]], $this->db->query('SELECT 1 AS "0", 2 AS "1"'));
+        $this->assertSame([[5 => 1, 'n' => 'v']], $this->db->query("SELECT 1 AS \"5\", 'v' AS n"));
+        $this->assertSame(['columns' => ['0', '1'], 'rows' => [[1, 2]]],
+            $this->db->queryRaw('SELECT 1 AS "0", 2 AS "1"'));
+    }
+
+    public function testManyRowsKeepOrderAndValues(): void
+    {
+        $this->db->exec('CREATE TABLE sh4 (id INTEGER PRIMARY KEY, s TEXT, f FLOAT, b BOOLEAN, n INTEGER)');
+        $rows = [];
+        for ($i = 1; $i <= 500; $i++) {
+            $rows[] = [$i, str_repeat('s', $i % 7), $i / 4, $i % 2 === 0, $i % 3 === 0 ? null : $i];
+        }
+        $this->db->executeBatch('INSERT INTO sh4 VALUES ($1, $2, $3, $4, $5)', $rows);
+
+        $got = $this->db->prepare('SELECT id, s, f, b, n FROM sh4 ORDER BY id')->query();
+        $this->assertCount(500, $got);
+        foreach ($got as $k => $row) {
+            [$id, $s, $f, $b, $n] = $rows[$k];
+            $this->assertSame(['id' => $id, 's' => $s, 'f' => (float)$f, 'b' => $b, 'n' => $n], $row);
+        }
+        $raw = $this->db->queryRaw('SELECT id, n FROM sh4 WHERE id <= 3 ORDER BY id');
+        $this->assertSame([[1, 1], [2, 2], [3, null]], $raw['rows']);
+    }
+
+    public function testTimestampFormattingEdges(): void
+    {
+        $this->db->exec('CREATE TABLE ts1 (id INTEGER PRIMARY KEY, t TIMESTAMP)');
+        $cases = [
+            1 => ['1970-01-01 00:00:00', '1970-01-01T00:00:00.000000000Z'],
+            2 => ['1969-12-31 23:59:59.5', '1969-12-31T23:59:59.500000000Z'],
+            3 => ['2000-02-29 12:34:56.789', '2000-02-29T12:34:56.789000000Z'],
+            4 => ['1900-03-01 00:00:01', '1900-03-01T00:00:01.000000000Z'],
+            5 => ['2262-04-11 23:47:16.854775', '2262-04-11T23:47:16.854775000Z'],
+            6 => ['1677-09-21 00:12:43.145225', '1677-09-21T00:12:43.145225000Z'],
+        ];
+        foreach ($cases as $id => [$in]) {
+            $this->db->execute('INSERT INTO ts1 VALUES ($1, $2)', [$id, $in]);
+        }
+        foreach ($this->db->query('SELECT id, t FROM ts1 ORDER BY id') as $row) {
+            $this->assertSame($cases[$row['id']][1], $row['t'], "row {$row['id']}");
+        }
+    }
+
+    public function testParamsPassedByReference(): void
+    {
+        $this->db->exec('CREATE TABLE rf (id INTEGER PRIMARY KEY, n TEXT)');
+        $id = 1;
+        $name = 'ref';
+        $params = [&$id, &$name];
+        $this->db->execute('INSERT INTO rf VALUES ($1, $2)', $params);
+        $named = ['id' => &$id];
+        $this->assertSame(['n' => 'ref'], $this->db->queryOne('SELECT n FROM rf WHERE id = :id', $named));
+        $this->assertSame(['n' => 'ref'], $this->db->prepare('SELECT n FROM rf WHERE id = $1')->queryOne([&$id]));
+    }
+
+    public function testNamedParamsIgnoreExtraKeysAndRejectMissingOnes(): void
+    {
+        $this->db->exec('CREATE TABLE np (id INTEGER PRIMARY KEY, n TEXT)');
+        $this->db->execute('INSERT INTO np VALUES (:id, :n)', ['n' => 'a', 'id' => 1, 'unused' => 5]);
+        $this->assertSame(['n' => 'a'], $this->db->queryOne('SELECT n FROM np WHERE id = :id OR id = :id', ['id' => 1]));
+
+        $this->expectException(StoolapException::class);
+        $this->db->query('SELECT n FROM np WHERE id = :id', ['other' => 1]);
+    }
+
+    public function testTransactionNamedParamsSeeOwnWrites(): void
+    {
+        $this->db->exec('CREATE TABLE tnp (id INTEGER PRIMARY KEY, n TEXT)');
+        $tx = $this->db->begin();
+        $this->assertSame(1, $tx->execute('INSERT INTO tnp VALUES (:id, :n)', ['n' => 'in-tx', 'id' => 1]));
+        $this->assertSame([['n' => 'in-tx']], $tx->query('SELECT n FROM tnp WHERE id = :id', ['id' => 1]));
+        $this->assertNull($this->db->queryOne('SELECT n FROM tnp WHERE id = :id', ['id' => 1]));
+        $tx->rollback();
+        $this->assertNull($this->db->queryOne('SELECT n FROM tnp WHERE id = :id', ['id' => 1]));
+    }
+
+    public function testQueryErrorRaisedWhileProducingRows(): void
+    {
+        $this->db->exec('CREATE TABLE qe (id INTEGER PRIMARY KEY)');
+        $this->db->exec('INSERT INTO qe VALUES (1)');
+        $stmt = $this->db->prepare('SELECT 9223372036854775807 + id AS x FROM qe');
+        foreach ([
+            fn() => $this->db->query('SELECT 9223372036854775807 + id AS x FROM qe'),
+            fn() => $stmt->query(),
+            fn() => $this->db->begin()->queryOne('SELECT 9223372036854775807 + id AS x FROM qe'),
+        ] as $i => $run) {
+            try {
+                $run();
+                $this->fail("call $i did not throw");
+            } catch (StoolapException $e) {
+                $this->assertStringContainsString('overflow', $e->getMessage());
+            }
+        }
+    }
 }

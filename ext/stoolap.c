@@ -50,6 +50,13 @@ static inline zend_class_entry *get_datetime_ce(void) {
     return datetime_interface_ce;
 }
 
+typedef struct {
+    zend_string *header;    /* packed column-name bytes the shape was built from */
+    zend_string **names;
+    uint32_t col_count;
+    HashTable *tmpl;
+} row_shape;
+
 /* ================================================================
  * Object structs
  * ================================================================ */
@@ -60,6 +67,7 @@ typedef struct {
     void *shm_base;           /* mmap'd shared memory, NULL = direct */
     char shm_name[32];        /* for shm_unlink */
     char dsn[256];            /* stored DSN for clone support */
+    row_shape shape;          /* last ad hoc result layout (Database + Transaction queries) */
     zend_object std;
 } stoolap_db_obj;
 
@@ -71,6 +79,7 @@ typedef struct {
     StoolapValue *cached_values;
     int32_t cached_count;
     uint32_t proxy_stmt_id;
+    row_shape shape;
     zval db_zv;     /* strong reference to Database object — prevents GC */
     zend_object std;
 } stoolap_stmt_obj;
@@ -127,12 +136,41 @@ static inline void decode_json_value(const uint8_t *data, uint32_t len, zval *de
     if (json_str != stack_buf) efree(json_str);
 }
 
-/* Format timestamp nanos → ISO 8601 string, returns length written */
+static inline void put2(char *p, int v) { p[0] = (char)('0' + v / 10); p[1] = (char)('0' + v % 10); }
+
+/* Format timestamp nanos → ISO 8601 string, returns length written.
+ * Converts days to a civil date arithmetically (Hinnant's days_to_civil)
+ * instead of gmtime_r + snprintf; years outside 0000-9999 take the libc path. */
 static inline int format_timestamp(int64_t nanos, char *tsbuf, size_t tsbuf_size)
 {
     int64_t secs = nanos / 1000000000LL;
     int64_t frac = nanos % 1000000000LL;
     if (frac < 0) { secs--; frac += 1000000000LL; }
+
+    int64_t days = secs / 86400, sod = secs % 86400;
+    if (sod < 0) { sod += 86400; days--; }
+    int64_t z = days + 719468;
+    int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    int64_t doe = z - era * 146097;
+    int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    int64_t mp = (5 * doy + 2) / 153;
+    int day = (int)(doy - (153 * mp + 2) / 5 + 1);
+    int mon = (int)(mp < 10 ? mp + 3 : mp - 9);
+    int64_t year = yoe + era * 400 + (mon <= 2);
+
+    if (year >= 0 && year <= 9999 && tsbuf_size >= 31) {
+        char *p = tsbuf;
+        put2(p, (int)(year / 100)); put2(p + 2, (int)(year % 100));
+        p[4] = '-'; put2(p + 5, mon); p[7] = '-'; put2(p + 8, day);
+        p[10] = 'T'; put2(p + 11, (int)(sod / 3600)); p[13] = ':';
+        put2(p + 14, (int)(sod / 60 % 60)); p[16] = ':'; put2(p + 17, (int)(sod % 60));
+        p[19] = '.';
+        for (int i = 28; i >= 20; i--) { p[i] = (char)('0' + frac % 10); frac /= 10; }
+        p[29] = 'Z'; p[30] = '\0';
+        return 30;
+    }
+
     time_t t = (time_t)secs;
     struct tm tm_buf;
     struct tm *tm = gmtime_r(&t, &tm_buf);
@@ -183,274 +221,170 @@ static int datetime_to_nanos(zval *dt_obj, int64_t *out_nanos)
     return 0;
 }
 
-/* Parse one row from buffer into an assoc array using pre-hashed zend_string names */
-static inline void parse_one_row_hashed(const uint8_t *buf, size_t *off,
-    zend_string **col_strs, uint32_t col_count, zval *row)
+/* Read one packed value at *off into dst */
+static zend_always_inline void read_value(const uint8_t *buf, size_t *off, zval *dst)
+{
+    switch (buf[(*off)++]) {
+        case 1: ZVAL_LONG(dst, (zend_long)buf_i64(buf + *off)); *off += 8; return;
+        case 2: ZVAL_DOUBLE(dst, buf_f64(buf + *off)); *off += 8; return;
+        case 3:
+        case 7: {
+            uint32_t len = buf_u32(buf + *off); *off += 4;
+            ZVAL_STRINGL_FAST(dst, (const char *)(buf + *off), len);
+            *off += len;
+            return;
+        }
+        case 4: ZVAL_BOOL(dst, buf[(*off)++] != 0); return;
+        case 5: {
+            char tsbuf[64];
+            int tslen = format_timestamp(buf_i64(buf + *off), tsbuf, sizeof(tsbuf));
+            *off += 8;
+            ZVAL_STRINGL(dst, tsbuf, tslen);
+            return;
+        }
+        case 6: {
+            uint32_t len = buf_u32(buf + *off); *off += 4;
+            decode_json_value(buf + *off, len, dst);
+            *off += len;
+            return;
+        }
+        default: ZVAL_NULL(dst); return;
+    }
+}
+
+/* ================================================================
+ * Row shape: the column layout of a result, kept on the Database and
+ * Statement objects so a repeated query does not rebuild its column keys.
+ *
+ * Rows are built by duplicating tmpl (every key mapped to NULL) and
+ * writing the values straight into its buckets, which skips hashing each
+ * key into each row. tmpl is NULL when two columns share a key or the
+ * keys form a packed array; rows then go through zend_symtable_update.
+ * ================================================================ */
+
+static void row_shape_free(row_shape *s)
+{
+    if (s->header) zend_string_release(s->header);
+    for (uint32_t i = 0; i < s->col_count; i++) zend_string_release(s->names[i]);
+    if (s->names) efree(s->names);
+    if (s->tmpl) zend_array_destroy(s->tmpl);
+    memset(s, 0, sizeof(*s));
+}
+
+/* Load the column header at buf into s, reusing s when the columns are
+ * unchanged. Returns the offset of the row count. */
+static size_t row_shape_load(row_shape *s, const uint8_t *buf)
+{
+    uint32_t col_count = buf_u32(buf);
+    size_t hdr_len = 4;
+    for (uint32_t i = 0; i < col_count; i++) hdr_len += 2 + buf_u16(buf + hdr_len);
+
+    if (s->header && ZSTR_LEN(s->header) == hdr_len &&
+        memcmp(ZSTR_VAL(s->header), buf, hdr_len) == 0) {
+        return hdr_len;
+    }
+
+    row_shape_free(s);
+    s->header = zend_string_init((const char *)buf, hdr_len, 0);
+    s->col_count = col_count;
+    s->names = emalloc(sizeof(zend_string *) * (col_count ? col_count : 1));
+    s->tmpl = zend_new_array(col_count);
+
+    size_t off = 4;
+    for (uint32_t i = 0; i < col_count; i++) {
+        uint16_t name_len = buf_u16(buf + off); off += 2;
+        s->names[i] = zend_string_init((const char *)(buf + off), name_len, 0);
+        off += name_len;
+        zval null;
+        ZVAL_NULL(&null);
+        zend_symtable_update(s->tmpl, s->names[i], &null);
+    }
+    if (zend_hash_num_elements(s->tmpl) != col_count || HT_IS_PACKED(s->tmpl)) {
+        zend_array_destroy(s->tmpl);
+        s->tmpl = NULL;
+    }
+    return hdr_len;
+}
+
+static zend_always_inline void build_row(const row_shape *s, const uint8_t *buf, size_t *off, zval *row)
+{
+    if (s->tmpl) {
+        HashTable *ht = zend_array_dup(s->tmpl);
+        Bucket *b = ht->arData;
+        for (uint32_t c = 0; c < s->col_count; c++) read_value(buf, off, &b[c].val);
+        ZVAL_ARR(row, ht);
+        return;
+    }
+    array_init_size(row, s->col_count);
+    for (uint32_t c = 0; c < s->col_count; c++) {
+        zval tmp;
+        read_value(buf, off, &tmp);
+        zend_symtable_update(Z_ARRVAL_P(row), s->names[c], &tmp);
+    }
+}
+
+static void build_raw_row(uint32_t col_count, const uint8_t *buf, size_t *off, zval *row)
 {
     array_init_size(row, col_count);
-    for (uint32_t c = 0; c < col_count; c++) {
-        uint8_t type = buf[(*off)++];
-        zval tmp;
-        switch (type) {
-            case 0: ZVAL_NULL(&tmp); break;
-            case 1: { int64_t v = buf_i64(buf + *off); *off += 8; ZVAL_LONG(&tmp, (zend_long)v); break; }
-            case 2: { double v = buf_f64(buf + *off); *off += 8; ZVAL_DOUBLE(&tmp, v); break; }
-            case 3: {
-                uint32_t len = buf_u32(buf + *off); *off += 4;
-                ZVAL_STRINGL(&tmp, (const char *)(buf + *off), len);
-                *off += len;
-                break;
-            }
-            case 4: { uint8_t v = buf[(*off)++]; ZVAL_BOOL(&tmp, v != 0); break; }
-            case 5: {
-                int64_t nanos = buf_i64(buf + *off); *off += 8;
-                char tsbuf[64];
-                int tslen = format_timestamp(nanos, tsbuf, sizeof(tsbuf));
-                ZVAL_STRINGL(&tmp, tsbuf, tslen);
-                break;
-            }
-            case 6: {
-                uint32_t len = buf_u32(buf + *off); *off += 4;
-                decode_json_value(buf + *off, len, &tmp);
-                *off += len;
-                break;
-            }
-            case 7: {
-                uint32_t len = buf_u32(buf + *off); *off += 4;
-                ZVAL_STRINGL(&tmp, (const char *)(buf + *off), len);
-                *off += len;
-                break;
-            }
-        }
-        zend_symtable_update(Z_ARRVAL_P(row), col_strs[c], &tmp);
-    }
-}
-
-/* ================================================================
- * Parse binary buffer → PHP associative array
- *
- * Uses zend_string* for column names so the hash is computed once
- * and reused for every row (avoids per-row rehashing).
- * Stack-allocates the column array for ≤32 columns.
- * ================================================================ */
-
-static void parse_buffer_assoc(const uint8_t *buf, size_t buf_len, zval *return_value)
-{
-    size_t off = 0;
-    uint32_t col_count = buf_u32(buf + off); off += 4;
-
-    /* Build zend_string* column names — hash computed once, reused per row */
-    zend_string *stack_strs[32];
-    zend_string **col_strs = (col_count <= 32) ? stack_strs
-                                               : emalloc(sizeof(zend_string *) * col_count);
-    for (uint32_t i = 0; i < col_count; i++) {
-        uint16_t name_len = buf_u16(buf + off); off += 2;
-        col_strs[i] = zend_string_init((const char *)(buf + off), name_len, 0);
-        off += name_len;
-    }
-
-    uint32_t row_count = buf_u32(buf + off); off += 4;
-    array_init_size(return_value, row_count);
-
-    for (uint32_t r = 0; r < row_count; r++) {
-        zval row;
-        array_init_size(&row, col_count);
-
+    zend_hash_real_init_packed(Z_ARRVAL_P(row));
+    ZEND_HASH_FILL_PACKED(Z_ARRVAL_P(row)) {
         for (uint32_t c = 0; c < col_count; c++) {
-            uint8_t type = buf[off++];
             zval tmp;
-            switch (type) {
-                case 0:
-                    ZVAL_NULL(&tmp);
-                    break;
-                case 1: {
-                    int64_t v = buf_i64(buf + off); off += 8;
-                    ZVAL_LONG(&tmp, (zend_long)v);
-                    break;
-                }
-                case 2: {
-                    double v = buf_f64(buf + off); off += 8;
-                    ZVAL_DOUBLE(&tmp, v);
-                    break;
-                }
-                case 3: {
-                    uint32_t len = buf_u32(buf + off); off += 4;
-                    ZVAL_STRINGL(&tmp, (const char *)(buf + off), len);
-                    off += len;
-                    break;
-                }
-                case 4: {
-                    uint8_t v = buf[off++];
-                    ZVAL_BOOL(&tmp, v != 0);
-                    break;
-                }
-                case 5: {
-                    int64_t nanos = buf_i64(buf + off); off += 8;
-                    char tsbuf[64];
-                    int tslen = format_timestamp(nanos, tsbuf, sizeof(tsbuf));
-                    ZVAL_STRINGL(&tmp, tsbuf, tslen);
-                    break;
-                }
-                case 6: {
-                    uint32_t len = buf_u32(buf + off); off += 4;
-                    decode_json_value(buf + off, len, &tmp);
-                    off += len;
-                    break;
-                }
-                case 7: {
-                    uint32_t len = buf_u32(buf + off); off += 4;
-                    ZVAL_STRINGL(&tmp, (const char *)(buf + off), len);
-                    off += len;
-                    break;
-                }
-            }
-            zend_symtable_update(Z_ARRVAL(row), col_strs[c], &tmp);
+            read_value(buf, off, &tmp);
+            ZEND_HASH_FILL_ADD(&tmp);
         }
-
-        add_next_index_zval(return_value, &row);
-    }
-
-    for (uint32_t i = 0; i < col_count; i++) {
-        zend_string_release(col_strs[i]);
-    }
-    if (col_strs != stack_strs) efree(col_strs);
+    } ZEND_HASH_FILL_END();
 }
 
 /* ================================================================
- * Parse binary buffer → first row only (for queryOne)
- * ================================================================ */
-
-static void parse_buffer_one(const uint8_t *buf, size_t buf_len, zval *return_value)
-{
-    size_t off = 0;
-    uint32_t col_count = buf_u32(buf + off); off += 4;
-
-    /* Build pre-hashed zend_string column names (stack for ≤32 columns) */
-    zend_string *stack_strs[32];
-    zend_string **col_strs = (col_count <= 32) ? stack_strs
-                                               : emalloc(sizeof(zend_string *) * col_count);
-    for (uint32_t i = 0; i < col_count; i++) {
-        uint16_t name_len = buf_u16(buf + off); off += 2;
-        col_strs[i] = zend_string_init((const char *)(buf + off), name_len, 0);
-        off += name_len;
-    }
-
-    uint32_t row_count = buf_u32(buf + off); off += 4;
-
-    if (row_count == 0) {
-        ZVAL_NULL(return_value);
-    } else {
-        parse_one_row_hashed(buf, &off, col_strs, col_count, return_value);
-    }
-
-    for (uint32_t i = 0; i < col_count; i++) {
-        zend_string_release(col_strs[i]);
-    }
-    if (col_strs != stack_strs) efree(col_strs);
-}
-
-/* ================================================================
- * Parse binary buffer → raw format
- * ================================================================ */
-
-static void parse_buffer_raw(const uint8_t *buf, size_t buf_len, zval *return_value)
-{
-    size_t off = 0;
-
-    uint32_t col_count = buf_u32(buf + off); off += 4;
-
-    zval columns;
-    array_init_size(&columns, col_count);
-    for (uint32_t i = 0; i < col_count; i++) {
-        uint16_t name_len = buf_u16(buf + off); off += 2;
-        add_next_index_stringl(&columns, (const char *)(buf + off), name_len);
-        off += name_len;
-    }
-
-    uint32_t row_count = buf_u32(buf + off); off += 4;
-
-    zval rows;
-    array_init_size(&rows, row_count);
-
-    for (uint32_t r = 0; r < row_count; r++) {
-        zval row;
-        array_init_size(&row, col_count);
-
-        for (uint32_t c = 0; c < col_count; c++) {
-            uint8_t type = buf[off++];
-            switch (type) {
-                case 0: add_next_index_null(&row); break;
-                case 1: { int64_t v = buf_i64(buf + off); off += 8; add_next_index_long(&row, (zend_long)v); break; }
-                case 2: { double v = buf_f64(buf + off); off += 8; add_next_index_double(&row, v); break; }
-                case 3: {
-                    uint32_t len = buf_u32(buf + off); off += 4;
-                    add_next_index_stringl(&row, (const char *)(buf + off), len);
-                    off += len;
-                    break;
-                }
-                case 4: { uint8_t v = buf[off++]; add_next_index_bool(&row, v != 0); break; }
-                case 5: {
-                    int64_t nanos = buf_i64(buf + off); off += 8;
-                    char tsbuf[64];
-                    int tslen = format_timestamp(nanos, tsbuf, sizeof(tsbuf));
-                    add_next_index_stringl(&row, tsbuf, tslen);
-                    break;
-                }
-                case 6: {
-                    uint32_t len = buf_u32(buf + off); off += 4;
-                    zval decoded;
-                    decode_json_value(buf + off, len, &decoded);
-                    off += len;
-                    add_next_index_zval(&row, &decoded);
-                    break;
-                }
-                case 7: {
-                    uint32_t len = buf_u32(buf + off); off += 4;
-                    add_next_index_stringl(&row, (const char *)(buf + off), len);
-                    off += len;
-                    break;
-                }
-            }
-        }
-        add_next_index_zval(&rows, &row);
-    }
-
-    array_init_size(return_value, 2);
-    add_assoc_zval(return_value, "columns", &columns);
-    add_assoc_zval(return_value, "rows", &rows);
-}
-
-/* ================================================================
- * Handle rows: fetch_all + parse + cleanup
+ * Parse a packed result buffer (stoolap_rows_fetch_all format)
+ *
+ * QUERY_ASSOC: list of assoc rows; QUERY_ONE: first row or NULL;
+ * QUERY_RAW: ['columns' => [...], 'rows' => [[...], ...]].
  * ================================================================ */
 
 enum { QUERY_ASSOC = 0, QUERY_ONE = 1, QUERY_RAW = 2 };
 
-static int stoolap_handle_rows(StoolapRows *rows, zval *return_value, int mode)
+static void parse_result(row_shape *s, const uint8_t *buf, size_t buf_len, int mode, zval *return_value)
 {
-    uint8_t *buf = NULL;
-    int64_t buf_len = 0;
-
-    int32_t rc = stoolap_rows_fetch_all(rows, &buf, &buf_len);
-    if (rc != 0) {
-        const char *err = stoolap_rows_errmsg(rows);
-        /* Throw before close — close frees the error string */
-        zend_throw_exception(stoolap_exception_ce, err ? err : "Failed to fetch rows", 0);
-        stoolap_rows_close(rows);
-        return FAILURE;
+    if (buf_len < 8) {
+        if (mode == QUERY_ONE) ZVAL_NULL(return_value);
+        else array_init(return_value);
+        return;
     }
+
+    size_t off = row_shape_load(s, buf);
+    uint32_t row_count = buf_u32(buf + off); off += 4;
+
+    if (mode == QUERY_ONE) {
+        if (row_count == 0) ZVAL_NULL(return_value);
+        else build_row(s, buf, &off, return_value);
+        return;
+    }
+
+    zval rows;
+    zval *list = (mode == QUERY_RAW) ? &rows : return_value;
+    array_init_size(list, row_count);
+    zend_hash_real_init_packed(Z_ARRVAL_P(list));
+    ZEND_HASH_FILL_PACKED(Z_ARRVAL_P(list)) {
+        for (uint32_t r = 0; r < row_count; r++) {
+            zval row;
+            if (mode == QUERY_RAW) build_raw_row(s->col_count, buf, &off, &row);
+            else build_row(s, buf, &off, &row);
+            ZEND_HASH_FILL_ADD(&row);
+        }
+    } ZEND_HASH_FILL_END();
 
     if (mode == QUERY_RAW) {
-        parse_buffer_raw(buf, (size_t)buf_len, return_value);
-    } else if (mode == QUERY_ONE) {
-        parse_buffer_one(buf, (size_t)buf_len, return_value);
-    } else {
-        parse_buffer_assoc(buf, (size_t)buf_len, return_value);
+        zval columns;
+        array_init_size(&columns, s->col_count);
+        for (uint32_t c = 0; c < s->col_count; c++) {
+            add_next_index_str(&columns, zend_string_copy(s->names[c]));
+        }
+        array_init_size(return_value, 2);
+        add_assoc_zval(return_value, "columns", &columns);
+        add_assoc_zval(return_value, "rows", &rows);
     }
-
-    stoolap_buffer_free(buf, buf_len);
-    stoolap_rows_close(rows);
-    return SUCCESS;
 }
 
 /* ================================================================
@@ -596,6 +530,7 @@ static inline int fill_one_param(zval *val, StoolapValue *out,
     zend_string ***json_strs, int *json_count, int *json_alloc)
 {
     out->_padding = 0;
+    ZVAL_DEREF(val);
 
     switch (Z_TYPE_P(val)) {
     case IS_NULL:
@@ -666,16 +601,23 @@ static inline int fill_one_param(zval *val, StoolapValue *out,
  * Build StoolapValue array from PHP array
  * ================================================================ */
 
+#define STOOLAP_STACK_PARAMS 16
+
 typedef struct {
     StoolapValue *values;
     int32_t count;
     zend_string **json_strs;
     int json_count;
     int json_alloc;
+    StoolapValue stack[STOOLAP_STACK_PARAMS]; /* backs values for short lists */
 } stoolap_params_t;
 
 static void stoolap_params_init(stoolap_params_t *p) {
-    memset(p, 0, sizeof(*p));
+    p->values = NULL;
+    p->count = 0;
+    p->json_strs = NULL;
+    p->json_count = 0;
+    p->json_alloc = 0;
 }
 
 static void stoolap_params_free(stoolap_params_t *p) {
@@ -683,8 +625,8 @@ static void stoolap_params_free(stoolap_params_t *p) {
         zend_string_release(p->json_strs[i]);
     }
     if (p->json_strs) efree(p->json_strs);
-    if (p->values) efree(p->values);
-    memset(p, 0, sizeof(*p));
+    if (p->values && p->values != p->stack) efree(p->values);
+    stoolap_params_init(p);
 }
 
 static int stoolap_build_params(zval *params, stoolap_params_t *out)
@@ -699,7 +641,8 @@ static int stoolap_build_params(zval *params, stoolap_params_t *out)
     int32_t count = zend_hash_num_elements(ht);
     if (count == 0) return SUCCESS;
 
-    StoolapValue *values = emalloc(count * sizeof(StoolapValue));
+    StoolapValue *values = count <= STOOLAP_STACK_PARAMS ? out->stack
+                                                         : emalloc(count * sizeof(StoolapValue));
     out->values = values;
     out->count = count;
 
@@ -710,6 +653,79 @@ static int stoolap_build_params(zval *params, stoolap_params_t *out)
             return FAILURE;
         }
         idx++;
+    } ZEND_HASH_FOREACH_END();
+
+    return SUCCESS;
+}
+
+/* ================================================================
+ * Named params for the engine's native :name binding (direct mode)
+ * ================================================================ */
+
+typedef struct {
+    StoolapNamedParam *items;
+    int32_t count;
+    zend_string **json_strs;
+    int json_count;
+    int json_alloc;
+    StoolapNamedParam stack[STOOLAP_STACK_PARAMS];
+} stoolap_named_t;
+
+static const char *find_named_param(const char *sql, size_t sql_len);
+
+static void stoolap_named_free(stoolap_named_t *p) {
+    for (int i = 0; i < p->json_count; i++) {
+        zend_string_release(p->json_strs[i]);
+    }
+    if (p->json_strs) efree(p->json_strs);
+    if (p->items && p->items != p->stack) efree(p->items);
+    p->items = NULL;
+    p->count = 0;
+    p->json_strs = NULL;
+    p->json_count = 0;
+}
+
+/* Is params an associative array the engine should bind by name? */
+static inline int params_are_named(zval *params) {
+    return params && Z_TYPE_P(params) == IS_ARRAY &&
+           zend_hash_num_elements(Z_ARRVAL_P(params)) > 0 &&
+           !zend_array_is_list(Z_ARRVAL_P(params));
+}
+
+/* Build named params from an associative array. Integer keys are ignored,
+ * as are keys the SQL never names; a placeholder without a key is an
+ * engine error. Returns SUCCESS or FAILURE (exception thrown). */
+static int stoolap_build_named(const char *sql, size_t sql_len, zval *params, stoolap_named_t *out)
+{
+    out->items = NULL;
+    out->count = 0;
+    out->json_strs = NULL;
+    out->json_count = 0;
+    out->json_alloc = 0;
+
+    if (!find_named_param(sql, sql_len)) {
+        zend_throw_exception(stoolap_exception_ce,
+            "Associative array parameters require named placeholders (:name) in SQL; "
+            "use a sequential array for positional ($1, $2, ...) placeholders", 0);
+        return FAILURE;
+    }
+
+    HashTable *ht = Z_ARRVAL_P(params);
+    uint32_t n = zend_hash_num_elements(ht);
+    out->items = n <= STOOLAP_STACK_PARAMS ? out->stack : emalloc(n * sizeof(StoolapNamedParam));
+
+    zend_string *key;
+    zval *val;
+    ZEND_HASH_FOREACH_STR_KEY_VAL(ht, key, val) {
+        if (!key) continue;
+        StoolapNamedParam *np = &out->items[out->count];
+        np->name = ZSTR_VAL(key);
+        np->name_len = (int32_t)ZSTR_LEN(key);
+        np->_padding = 0;
+        if (fill_one_param(val, &np->value, &out->json_strs, &out->json_count, &out->json_alloc) != SUCCESS) {
+            return FAILURE;
+        }
+        out->count++;
     } ZEND_HASH_FOREACH_END();
 
     return SUCCESS;
@@ -749,14 +765,12 @@ static int stoolap_batch_fill_params(zval *params, StoolapValue *values, int32_t
  * Rewrite named params (:name → $N)
  * ================================================================ */
 
-static char *rewrite_named_params_sql(const char *sql, size_t sql_len,
-    zend_string ***out_names, uint32_t *out_name_count)
+/* First ':name' placeholder outside quoted strings and comments, or NULL */
+static const char *find_named_param(const char *sql, size_t sql_len)
 {
     const char *p = sql;
     const char *end = sql + sql_len;
-    const char *first_colon = NULL;
 
-    /* Quick scan for ':name' outside of quoted strings and comments */
     while (p < end) {
         if (*p == '\'' || *p == '"') {
             char quote = *p++;
@@ -777,12 +791,20 @@ static char *rewrite_named_params_sql(const char *sql, size_t sql_len,
             p += 2;
             while (p < end && *p != '\n') p++;
         } else if (*p == ':' && (p + 1) < end && (isalpha((unsigned char)p[1]) || p[1] == '_')) {
-            first_colon = p;
-            break;
+            return p;
         } else {
             p++;
         }
     }
+    return NULL;
+}
+
+static char *rewrite_named_params_sql(const char *sql, size_t sql_len,
+    zend_string ***out_names, uint32_t *out_name_count)
+{
+    const char *p;
+    const char *end = sql + sql_len;
+    const char *first_colon = find_named_param(sql, sql_len);
 
     if (!first_colon) {
         *out_names = NULL;
@@ -905,6 +927,26 @@ static int reorder_named_params(zval *params, zend_string **names, uint32_t name
     return SUCCESS;
 }
 
+/* Fill values in placeholder order straight from an associative array,
+ * without building a positional copy of it first.
+ * Returns SUCCESS or FAILURE (exception thrown). */
+static int fill_named_values(HashTable *ht, zend_string **names, uint32_t name_count,
+    StoolapValue *values, zend_string ***json_strs, int *json_count, int *json_alloc)
+{
+    for (uint32_t i = 0; i < name_count; i++) {
+        zval *val = zend_hash_find(ht, names[i]);
+        if (!val) {
+            zend_throw_exception_ex(stoolap_exception_ce, 0,
+                "Missing named parameter: :%s", ZSTR_VAL(names[i]));
+            return FAILURE;
+        }
+        if (fill_one_param(val, &values[i], json_strs, json_count, json_alloc) != SUCCESS) {
+            return FAILURE;
+        }
+    }
+    return SUCCESS;
+}
+
 /* Check if array is a list (sequential integer keys 0..n-1).
  * Uses zend_array_is_list which is O(1) for packed arrays. */
 static inline int zval_array_is_list(zval *arr)
@@ -926,6 +968,17 @@ static int stoolap_stmt_build_params(stoolap_stmt_obj *sobj, zval *params, stool
     int32_t count = zend_hash_num_elements(ht);
     if (count == 0) return SUCCESS;
 
+    int named = !zend_array_is_list(ht);
+    if (named) {
+        if (!sobj->param_names || sobj->param_name_count == 0) {
+            zend_throw_exception(stoolap_exception_ce,
+                "Associative array parameters require named placeholders (:name) in SQL; "
+                "use a sequential array for positional ($1, $2, ...) placeholders", 0);
+            return FAILURE;
+        }
+        count = (int32_t)sobj->param_name_count;
+    }
+
     /* Reuse cached array if same size */
     StoolapValue *values;
     if (sobj->cached_values && sobj->cached_count == count) {
@@ -939,6 +992,11 @@ static int stoolap_stmt_build_params(stoolap_stmt_obj *sobj, zval *params, stool
 
     out->values = values;
     out->count = count;
+
+    if (named) {
+        return fill_named_values(ht, sobj->param_names, sobj->param_name_count, values,
+                                 &out->json_strs, &out->json_count, &out->json_alloc);
+    }
 
     int idx = 0;
     zval *val;
@@ -959,7 +1017,7 @@ static void stoolap_stmt_params_free(stoolap_params_t *p) {
     }
     if (p->json_strs) efree(p->json_strs);
     /* Do NOT efree values — they're cached on the stmt object */
-    memset(p, 0, sizeof(*p));
+    stoolap_params_init(p);
 }
 
 /* Full named param rewrite for Database methods (rewrite SQL + reorder params).
@@ -1367,6 +1425,7 @@ static void stoolap_db_free(zend_object *object)
         stoolap_close(obj->db);
         obj->db = NULL;
     }
+    row_shape_free(&obj->shape);
     zend_object_std_dtor(object);
 }
 
@@ -1418,6 +1477,7 @@ static void stoolap_stmt_free(zend_object *object)
         efree(obj->cached_values);
         obj->cached_values = NULL;
     }
+    row_shape_free(&obj->shape);
     zval_ptr_dtor(&obj->db_zv);
     ZVAL_UNDEF(&obj->db_zv);
     zend_object_std_dtor(object);
@@ -1634,6 +1694,26 @@ PHP_METHOD(Stoolap_Database, execute)
     char *clean_sql = strip_semicolon(sql, sql_len, &clean_len);
     const char *actual_sql = clean_sql ? clean_sql : sql;
 
+    /* Direct mode binds named params natively, no SQL rewrite */
+    if (!PROXY_ACTIVE(obj) && params_are_named(params)) {
+        stoolap_named_t np;
+        if (stoolap_build_named(actual_sql, clean_sql ? clean_len : sql_len, params, &np) != SUCCESS) {
+            stoolap_named_free(&np);
+            if (clean_sql) efree(clean_sql);
+            RETURN_THROWS();
+        }
+        int64_t affected = 0;
+        int32_t rc = stoolap_exec_named(obj->db, actual_sql, np.items, np.count, &affected);
+        stoolap_named_free(&np);
+        if (clean_sql) efree(clean_sql);
+        if (rc != 0) {
+            const char *err = stoolap_errmsg(obj->db);
+            zend_throw_exception(stoolap_exception_ce, err ? err : "execute failed", 0);
+            RETURN_THROWS();
+        }
+        RETURN_LONG((zend_long)affected);
+    }
+
     /* Named param rewrite */
     char *rewritten_sql = NULL;
     zval positional_params;
@@ -1800,26 +1880,16 @@ PHP_METHOD(Stoolap_Database, executeBatch)
                 zend_throw_exception(stoolap_exception_ce, "executeBatch: each element must be an array", 0);
                 RETURN_THROWS();
             }
-            /* Reorder named params if needed */
-            zval positional;
-            ZVAL_UNDEF(&positional);
-            zval *fill_row = row;
+            /* Associative rows bind by name, straight into the value array */
+            int fill_rc;
             if (param_names && !zval_array_is_list(row)) {
-                if (reorder_named_params(row, param_names, param_name_count, &positional) != SUCCESS) {
-                    stoolap_batch_json_free(batch_json_strs, &batch_json_count);
-                    efree(batch_values); efree(batch_json_strs);
-                    if (param_names) {
-                        for (uint32_t i = 0; i < param_name_count; i++) zend_string_release(param_names[i]);
-                        efree(param_names);
-                    }
-                    if (clean_sql) efree(clean_sql);
-                    RETURN_THROWS();
-                }
-                fill_row = &positional;
+                fill_rc = (params_per_row == (int32_t)param_name_count)
+                    ? fill_named_values(Z_ARRVAL_P(row), param_names, param_name_count, batch_values,
+                                        &batch_json_strs, &batch_json_count, &batch_json_alloc)
+                    : FAILURE;
+            } else {
+                fill_rc = stoolap_batch_fill_params(row, batch_values, params_per_row, batch_json_strs, &batch_json_count, batch_json_alloc);
             }
-            int fill_rc = stoolap_batch_fill_params(fill_row, batch_values, params_per_row,
-                                                     batch_json_strs, &batch_json_count, batch_json_alloc);
-            if (Z_TYPE(positional) != IS_UNDEF) zval_ptr_dtor(&positional);
             if (fill_rc != SUCCESS) {
                 stoolap_batch_json_free(batch_json_strs, &batch_json_count);
                 efree(batch_values); efree(batch_json_strs);
@@ -1944,28 +2014,16 @@ PHP_METHOD(Stoolap_Database, executeBatch)
             RETURN_THROWS();
         }
 
-        /* Reorder associative rows to positional using name mapping */
-        zval positional;
-        ZVAL_UNDEF(&positional);
-        zval *fill_row = row;
+        /* Associative rows bind by name, straight into the value array */
+        int fill_rc;
         if (param_names && !zval_array_is_list(row)) {
-            if (reorder_named_params(row, param_names, param_name_count, &positional) != SUCCESS) {
-                stoolap_batch_json_free(json_strs, &json_count);
-                efree(values); efree(json_strs);
-                stoolap_stmt_finalize(stmt);
-                stoolap_tx_rollback(tx);
-                if (param_names) {
-                    for (uint32_t i = 0; i < param_name_count; i++) zend_string_release(param_names[i]);
-                    efree(param_names);
-                }
-                if (clean_sql) efree(clean_sql);
-                RETURN_THROWS();
-            }
-            fill_row = &positional;
+            fill_rc = (param_count == (int32_t)param_name_count)
+                ? fill_named_values(Z_ARRVAL_P(row), param_names, param_name_count, values,
+                                    &json_strs, &json_count, &json_alloc)
+                : FAILURE;
+        } else {
+            fill_rc = stoolap_batch_fill_params(row, values, param_count, json_strs, &json_count, json_alloc);
         }
-
-        int fill_rc = stoolap_batch_fill_params(fill_row, values, param_count, json_strs, &json_count, json_alloc);
-        if (Z_TYPE(positional) != IS_UNDEF) zval_ptr_dtor(&positional);
 
         if (fill_rc != SUCCESS) {
             stoolap_batch_json_free(json_strs, &json_count);
@@ -2062,6 +2120,30 @@ static void stoolap_db_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
         }
     }
 
+    /* Direct mode binds named params natively, no SQL rewrite */
+    if (!PROXY_ACTIVE(obj) && params_are_named(params)) {
+        stoolap_named_t np;
+        if (stoolap_build_named(actual_sql, actual_len, params, &np) != SUCCESS) {
+            stoolap_named_free(&np);
+            if (limited_sql) efree(limited_sql);
+            if (clean_sql) efree(clean_sql);
+            RETURN_THROWS();
+        }
+        const uint8_t *buf = NULL;
+        int64_t buf_len = 0;
+        int32_t rc = stoolap_query_named_all(obj->db, NULL, actual_sql, np.items, np.count, &buf, &buf_len);
+        stoolap_named_free(&np);
+        if (limited_sql) efree(limited_sql);
+        if (clean_sql) efree(clean_sql);
+        if (rc != 0) {
+            const char *err = stoolap_errmsg(obj->db);
+            zend_throw_exception(stoolap_exception_ce, err ? err : "query failed", 0);
+            RETURN_THROWS();
+        }
+        parse_result(&obj->shape, buf, (size_t)buf_len, mode, return_value);
+        return;
+    }
+
     /* Named param rewrite (client-side, before proxy path) */
     char *rewritten_sql = NULL;
     zval positional_params;
@@ -2140,48 +2222,27 @@ static void stoolap_db_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
             proxy_throw_error(obj);
             RETURN_THROWS();
         }
-        uint8_t *resp = SHM_RESP(obj->shm_base);
-        uint32_t buf_len = SHM_CTL(obj->shm_base)->resp_len;
-        if (buf_len > 0) {
-            if (mode == QUERY_RAW) {
-                parse_buffer_raw(resp, buf_len, return_value);
-            } else if (mode == QUERY_ONE) {
-                parse_buffer_one(resp, buf_len, return_value);
-            } else {
-                parse_buffer_assoc(resp, buf_len, return_value);
-            }
-        } else {
-            if (mode == QUERY_ONE) {
-                ZVAL_NULL(return_value);
-            } else {
-                array_init(return_value);
-            }
-        }
+        parse_result(&obj->shape, SHM_RESP(obj->shm_base),
+                     SHM_CTL(obj->shm_base)->resp_len, mode, return_value);
         return;
     }
 
-    /* Direct mode */
-    StoolapRows *rows = NULL;
-    int32_t rc;
-
-    if (!has_params) {
-        rc = stoolap_query(obj->db, actual_sql, &rows);
-    } else {
-        stoolap_params_t sp;
-        if (stoolap_build_params(final_params, &sp) != SUCCESS) {
-            stoolap_params_free(&sp);
-            if (rewritten_sql) efree(rewritten_sql);
-            if (Z_TYPE(positional_params) != IS_UNDEF) zval_ptr_dtor(&positional_params);
-            if (limited_sql) efree(limited_sql);
-            if (clean_sql) efree(clean_sql);
-            RETURN_THROWS();
-        }
-
-        rc = stoolap_query_params(obj->db, final_sql, sp.values, sp.count, &rows);
-
+    /* Direct mode: one call, the packed buffer belongs to obj->db */
+    stoolap_params_t sp;
+    if (stoolap_build_params(final_params, &sp) != SUCCESS) {
         stoolap_params_free(&sp);
+        if (rewritten_sql) efree(rewritten_sql);
+        if (Z_TYPE(positional_params) != IS_UNDEF) zval_ptr_dtor(&positional_params);
+        if (limited_sql) efree(limited_sql);
+        if (clean_sql) efree(clean_sql);
+        RETURN_THROWS();
     }
 
+    const uint8_t *buf = NULL;
+    int64_t buf_len = 0;
+    int32_t rc = stoolap_query_params_all(obj->db, NULL, final_sql, sp.values, sp.count, &buf, &buf_len);
+
+    stoolap_params_free(&sp);
     if (rewritten_sql) efree(rewritten_sql);
     if (Z_TYPE(positional_params) != IS_UNDEF) zval_ptr_dtor(&positional_params);
     if (limited_sql) efree(limited_sql);
@@ -2193,7 +2254,7 @@ static void stoolap_db_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
         RETURN_THROWS();
     }
 
-    stoolap_handle_rows(rows, return_value, mode);
+    parse_result(&obj->shape, buf, (size_t)buf_len, mode, return_value);
 }
 
 PHP_METHOD(Stoolap_Database, query) { stoolap_db_query_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, QUERY_ASSOC); }
@@ -2501,28 +2562,6 @@ static inline int stoolap_stmt_check_db(stoolap_stmt_obj *sobj)
     return 0;
 }
 
-/* Returns SUCCESS or FAILURE (exception thrown on missing named param). */
-static int stmt_normalize_params(stoolap_stmt_obj *sobj, zval *params, zval *out)
-{
-    if (params == NULL || Z_TYPE_P(params) != IS_ARRAY ||
-        zend_hash_num_elements(Z_ARRVAL_P(params)) == 0 ||
-        zval_array_is_list(params)) {
-        ZVAL_UNDEF(out);
-        return SUCCESS;
-    }
-
-    /* Named params → positional using stored param_names */
-    if (sobj->param_names != NULL && sobj->param_name_count > 0) {
-        return reorder_named_params(params, sobj->param_names, sobj->param_name_count, out);
-    } else {
-        /* params is associative but statement has no named placeholders */
-        zend_throw_exception(stoolap_exception_ce,
-            "Associative array parameters require named placeholders (:name) in SQL; "
-            "use a sequential array for positional ($1, $2, ...) placeholders", 0);
-        return FAILURE;
-    }
-}
-
 PHP_METHOD(Stoolap_Statement, execute)
 {
     zval *params = NULL;
@@ -2541,16 +2580,9 @@ PHP_METHOD(Stoolap_Statement, execute)
         RETURN_THROWS();
     }
 
-    zval normalized;
-    if (stmt_normalize_params(sobj, params, &normalized) != SUCCESS) {
-        RETURN_THROWS();
-    }
-    zval *final_params = Z_TYPE(normalized) != IS_UNDEF ? &normalized : params;
-
     stoolap_params_t sp;
-    if (stoolap_stmt_build_params(sobj, final_params, &sp) != SUCCESS) {
+    if (stoolap_stmt_build_params(sobj, params, &sp) != SUCCESS) {
         stoolap_stmt_params_free(&sp);
-        if (Z_TYPE(normalized) != IS_UNDEF) zval_ptr_dtor(&normalized);
         RETURN_THROWS();
     }
 
@@ -2564,7 +2596,6 @@ PHP_METHOD(Stoolap_Statement, execute)
         memcpy(req + off, &pcnt, 4); off += 4;
         int32_t pw = proxy_write_params(req + off, SHM_REQ_MAX - off, sp.values, sp.count);
         stoolap_stmt_params_free(&sp);
-        if (Z_TYPE(normalized) != IS_UNDEF) zval_ptr_dtor(&normalized);
         if (pw < 0) {
             zend_throw_exception(stoolap_exception_ce, "params too large for shared memory", 0);
             RETURN_THROWS();
@@ -2589,7 +2620,6 @@ PHP_METHOD(Stoolap_Statement, execute)
     int32_t rc = stoolap_stmt_exec(sobj->stmt, sp.values, sp.count, &affected);
 
     stoolap_stmt_params_free(&sp);
-    if (Z_TYPE(normalized) != IS_UNDEF) zval_ptr_dtor(&normalized);
 
     if (rc != 0) {
         const char *err = stoolap_stmt_errmsg(sobj->stmt);
@@ -2618,16 +2648,9 @@ static void stoolap_stmt_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
         RETURN_THROWS();
     }
 
-    zval normalized;
-    if (stmt_normalize_params(sobj, params, &normalized) != SUCCESS) {
-        RETURN_THROWS();
-    }
-    zval *final_params = Z_TYPE(normalized) != IS_UNDEF ? &normalized : params;
-
     stoolap_params_t sp;
-    if (stoolap_stmt_build_params(sobj, final_params, &sp) != SUCCESS) {
+    if (stoolap_stmt_build_params(sobj, params, &sp) != SUCCESS) {
         stoolap_stmt_params_free(&sp);
-        if (Z_TYPE(normalized) != IS_UNDEF) zval_ptr_dtor(&normalized);
         RETURN_THROWS();
     }
 
@@ -2641,7 +2664,6 @@ static void stoolap_stmt_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
         memcpy(req + off, &pcnt, 4); off += 4;
         int32_t pw = proxy_write_params(req + off, SHM_REQ_MAX - off, sp.values, sp.count);
         stoolap_stmt_params_free(&sp);
-        if (Z_TYPE(normalized) != IS_UNDEF) zval_ptr_dtor(&normalized);
         if (pw < 0) {
             zend_throw_exception(stoolap_exception_ce, "params too large for shared memory", 0);
             RETURN_THROWS();
@@ -2657,31 +2679,17 @@ static void stoolap_stmt_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
             proxy_throw_error(dobj);
             RETURN_THROWS();
         }
-        uint8_t *resp = SHM_RESP(dobj->shm_base);
-        uint32_t buf_len = SHM_CTL(dobj->shm_base)->resp_len;
-        if (buf_len > 0) {
-            if (mode == QUERY_RAW) {
-                parse_buffer_raw(resp, buf_len, return_value);
-            } else if (mode == QUERY_ONE) {
-                parse_buffer_one(resp, buf_len, return_value);
-            } else {
-                parse_buffer_assoc(resp, buf_len, return_value);
-            }
-        } else {
-            if (mode == QUERY_ONE) {
-                ZVAL_NULL(return_value);
-            } else {
-                array_init(return_value);
-            }
-        }
+        parse_result(&sobj->shape, SHM_RESP(dobj->shm_base),
+                     SHM_CTL(dobj->shm_base)->resp_len, mode, return_value);
         return;
     }
 
-    StoolapRows *rows = NULL;
-    int32_t rc = stoolap_stmt_query(sobj->stmt, sp.values, sp.count, &rows);
+    /* One call, the packed buffer belongs to the statement */
+    const uint8_t *buf = NULL;
+    int64_t buf_len = 0;
+    int32_t rc = stoolap_stmt_query_all(sobj->stmt, NULL, sp.values, sp.count, &buf, &buf_len);
 
     stoolap_stmt_params_free(&sp);
-    if (Z_TYPE(normalized) != IS_UNDEF) zval_ptr_dtor(&normalized);
 
     if (rc != 0) {
         const char *err = stoolap_stmt_errmsg(sobj->stmt);
@@ -2689,7 +2697,7 @@ static void stoolap_stmt_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
         RETURN_THROWS();
     }
 
-    stoolap_handle_rows(rows, return_value, mode);
+    parse_result(&sobj->shape, buf, (size_t)buf_len, mode, return_value);
 }
 
 PHP_METHOD(Stoolap_Statement, query) { stoolap_stmt_query_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, QUERY_ASSOC); }
@@ -2833,6 +2841,26 @@ PHP_METHOD(Stoolap_Transaction, execute)
     const char *actual_sql = clean_sql ? clean_sql : sql;
     size_t actual_len = clean_sql ? clean_len : sql_len;
 
+    /* Direct mode binds named params natively, no SQL rewrite */
+    if (obj->tx && params_are_named(params)) {
+        stoolap_named_t np;
+        if (stoolap_build_named(actual_sql, actual_len, params, &np) != SUCCESS) {
+            stoolap_named_free(&np);
+            if (clean_sql) efree(clean_sql);
+            RETURN_THROWS();
+        }
+        int64_t affected = 0;
+        int32_t rc = stoolap_tx_exec_named(obj->tx, actual_sql, np.items, np.count, &affected);
+        stoolap_named_free(&np);
+        if (clean_sql) efree(clean_sql);
+        if (rc != 0) {
+            const char *err = stoolap_tx_errmsg(obj->tx);
+            zend_throw_exception(stoolap_exception_ce, err ? err : "tx execute failed", 0);
+            RETURN_THROWS();
+        }
+        RETURN_LONG((zend_long)affected);
+    }
+
     char *rewritten_sql = NULL;
     zval positional_params;
     ZVAL_UNDEF(&positional_params);
@@ -2946,6 +2974,30 @@ static void stoolap_tx_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
         }
     }
 
+    /* Direct mode binds named params natively, no SQL rewrite */
+    if (obj->tx && params_are_named(params)) {
+        stoolap_named_t np;
+        if (stoolap_build_named(actual_sql, actual_len, params, &np) != SUCCESS) {
+            stoolap_named_free(&np);
+            if (limited_sql) efree(limited_sql);
+            if (clean_sql) efree(clean_sql);
+            RETURN_THROWS();
+        }
+        const uint8_t *buf = NULL;
+        int64_t buf_len = 0;
+        int32_t rc = stoolap_query_named_all(obj->db, obj->tx, actual_sql, np.items, np.count, &buf, &buf_len);
+        stoolap_named_free(&np);
+        if (limited_sql) efree(limited_sql);
+        if (clean_sql) efree(clean_sql);
+        if (rc != 0) {
+            const char *err = stoolap_errmsg(obj->db);
+            zend_throw_exception(stoolap_exception_ce, err ? err : "tx query failed", 0);
+            RETURN_THROWS();
+        }
+        parse_result(&Z_STOOLAP_DB_P(&obj->db_zv)->shape, buf, (size_t)buf_len, mode, return_value);
+        return;
+    }
+
     /* Named param rewrite (client-side) */
     char *rewritten_sql = NULL;
     zval positional_params;
@@ -3020,60 +3072,39 @@ static void stoolap_tx_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
             proxy_throw_error(dobj);
             RETURN_THROWS();
         }
-        uint8_t *resp = SHM_RESP(dobj->shm_base);
-        uint32_t buf_len = SHM_CTL(dobj->shm_base)->resp_len;
-        if (buf_len > 0) {
-            if (mode == QUERY_RAW) {
-                parse_buffer_raw(resp, buf_len, return_value);
-            } else if (mode == QUERY_ONE) {
-                parse_buffer_one(resp, buf_len, return_value);
-            } else {
-                parse_buffer_assoc(resp, buf_len, return_value);
-            }
-        } else {
-            if (mode == QUERY_ONE) {
-                ZVAL_NULL(return_value);
-            } else {
-                array_init(return_value);
-            }
-        }
+        parse_result(&dobj->shape, SHM_RESP(dobj->shm_base),
+                     SHM_CTL(dobj->shm_base)->resp_len, mode, return_value);
         return;
     }
 
-    /* Direct mode */
-    StoolapRows *rows = NULL;
-    int32_t rc;
-
-    if (!has_params) {
-        rc = stoolap_tx_query(obj->tx, actual_sql, &rows);
-    } else {
-        stoolap_params_t sp;
-        if (stoolap_build_params(final_params, &sp) != SUCCESS) {
-            stoolap_params_free(&sp);
-            if (rewritten_sql) efree(rewritten_sql);
-            if (Z_TYPE(positional_params) != IS_UNDEF) zval_ptr_dtor(&positional_params);
-            if (limited_sql) efree(limited_sql);
-            if (clean_sql) efree(clean_sql);
-            RETURN_THROWS();
-        }
-
-        rc = stoolap_tx_query_params(obj->tx, final_sql, sp.values, sp.count, &rows);
-
+    /* Direct mode: one call inside obj->tx, the packed buffer belongs to obj->db */
+    stoolap_params_t sp;
+    if (stoolap_build_params(final_params, &sp) != SUCCESS) {
         stoolap_params_free(&sp);
+        if (rewritten_sql) efree(rewritten_sql);
+        if (Z_TYPE(positional_params) != IS_UNDEF) zval_ptr_dtor(&positional_params);
+        if (limited_sql) efree(limited_sql);
+        if (clean_sql) efree(clean_sql);
+        RETURN_THROWS();
     }
 
+    const uint8_t *buf = NULL;
+    int64_t buf_len = 0;
+    int32_t rc = stoolap_query_params_all(obj->db, obj->tx, final_sql, sp.values, sp.count, &buf, &buf_len);
+
+    stoolap_params_free(&sp);
     if (rewritten_sql) efree(rewritten_sql);
     if (Z_TYPE(positional_params) != IS_UNDEF) zval_ptr_dtor(&positional_params);
     if (limited_sql) efree(limited_sql);
     if (clean_sql) efree(clean_sql);
 
     if (rc != 0) {
-        const char *err = stoolap_tx_errmsg(obj->tx);
+        const char *err = stoolap_errmsg(obj->db);
         zend_throw_exception(stoolap_exception_ce, err ? err : "tx query failed", 0);
         RETURN_THROWS();
     }
 
-    stoolap_handle_rows(rows, return_value, mode);
+    parse_result(&dobj->shape, buf, (size_t)buf_len, mode, return_value);
 }
 
 PHP_METHOD(Stoolap_Transaction, query) { stoolap_tx_query_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, QUERY_ASSOC); }
@@ -3178,25 +3209,16 @@ PHP_METHOD(Stoolap_Transaction, executeBatch)
                 zend_throw_exception(stoolap_exception_ce, "executeBatch: each element must be an array", 0);
                 RETURN_THROWS();
             }
-            zval positional;
-            ZVAL_UNDEF(&positional);
-            zval *fill_row = row;
+            /* Associative rows bind by name, straight into the value array */
+            int fill_rc;
             if (param_names && !zval_array_is_list(row)) {
-                if (reorder_named_params(row, param_names, param_name_count, &positional) != SUCCESS) {
-                    stoolap_batch_json_free(batch_json_strs, &batch_json_count);
-                    efree(batch_values); efree(batch_json_strs);
-                    if (param_names) {
-                        for (uint32_t i = 0; i < param_name_count; i++) zend_string_release(param_names[i]);
-                        efree(param_names);
-                    }
-                    if (clean_sql) efree(clean_sql);
-                    RETURN_THROWS();
-                }
-                fill_row = &positional;
+                fill_rc = (params_per_row == (int32_t)param_name_count)
+                    ? fill_named_values(Z_ARRVAL_P(row), param_names, param_name_count, batch_values,
+                                        &batch_json_strs, &batch_json_count, &batch_json_alloc)
+                    : FAILURE;
+            } else {
+                fill_rc = stoolap_batch_fill_params(row, batch_values, params_per_row, batch_json_strs, &batch_json_count, batch_json_alloc);
             }
-            int fill_rc = stoolap_batch_fill_params(fill_row, batch_values, params_per_row,
-                                                     batch_json_strs, &batch_json_count, batch_json_alloc);
-            if (Z_TYPE(positional) != IS_UNDEF) zval_ptr_dtor(&positional);
             if (fill_rc != SUCCESS) {
                 stoolap_batch_json_free(batch_json_strs, &batch_json_count);
                 efree(batch_values); efree(batch_json_strs);
@@ -3307,27 +3329,16 @@ PHP_METHOD(Stoolap_Transaction, executeBatch)
             RETURN_THROWS();
         }
 
-        /* Reorder associative rows to positional using name mapping */
-        zval positional;
-        ZVAL_UNDEF(&positional);
-        zval *fill_row = row;
+        /* Associative rows bind by name, straight into the value array */
+        int fill_rc;
         if (param_names && !zval_array_is_list(row)) {
-            if (reorder_named_params(row, param_names, param_name_count, &positional) != SUCCESS) {
-                stoolap_batch_json_free(json_strs, &json_count);
-                efree(values); efree(json_strs);
-                stoolap_stmt_finalize(stmt);
-                if (param_names) {
-                    for (uint32_t i = 0; i < param_name_count; i++) zend_string_release(param_names[i]);
-                    efree(param_names);
-                }
-                if (clean_sql) efree(clean_sql);
-                RETURN_THROWS();
-            }
-            fill_row = &positional;
+            fill_rc = (param_count == (int32_t)param_name_count)
+                ? fill_named_values(Z_ARRVAL_P(row), param_names, param_name_count, values,
+                                    &json_strs, &json_count, &json_alloc)
+                : FAILURE;
+        } else {
+            fill_rc = stoolap_batch_fill_params(row, values, param_count, json_strs, &json_count, json_alloc);
         }
-
-        int fill_rc = stoolap_batch_fill_params(fill_row, values, param_count, json_strs, &json_count, json_alloc);
-        if (Z_TYPE(positional) != IS_UNDEF) zval_ptr_dtor(&positional);
 
         if (fill_rc != SUCCESS) {
             stoolap_batch_json_free(json_strs, &json_count);

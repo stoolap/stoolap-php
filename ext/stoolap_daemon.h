@@ -221,7 +221,6 @@ static inline int shm_wake(volatile uint32_t *addr)
 typedef struct StoolapDB StoolapDB;
 typedef struct StoolapStmt StoolapStmt;
 typedef struct StoolapTx StoolapTx;
-typedef struct StoolapRows StoolapRows;
 
 typedef struct StoolapValue {
     int32_t value_type;
@@ -238,6 +237,13 @@ typedef struct StoolapValue {
 
 #endif /* PHP_STOOLAP_H */
 
+typedef struct StoolapNamedParam {
+    const char *name;     /* without the ':' prefix, need not be NUL-terminated */
+    int32_t name_len;
+    int32_t _padding;
+    StoolapValue value;
+} StoolapNamedParam;
+
 /* Stoolap FFI — linked directly */
 extern const char *stoolap_version(void);
 extern int32_t stoolap_open(const char *, StoolapDB **);
@@ -247,28 +253,26 @@ extern int32_t stoolap_close(StoolapDB *);
 extern const char *stoolap_errmsg(const StoolapDB *);
 extern int32_t stoolap_exec(StoolapDB *, const char *, int64_t *);
 extern int32_t stoolap_exec_params(StoolapDB *, const char *, const StoolapValue *, int32_t, int64_t *);
-extern int32_t stoolap_query(StoolapDB *, const char *, StoolapRows **);
-extern int32_t stoolap_query_params(StoolapDB *, const char *, const StoolapValue *, int32_t, StoolapRows **);
 extern int32_t stoolap_prepare(StoolapDB *, const char *, StoolapStmt **);
 extern int32_t stoolap_stmt_exec(StoolapStmt *, const StoolapValue *, int32_t, int64_t *);
-extern int32_t stoolap_stmt_query(StoolapStmt *, const StoolapValue *, int32_t, StoolapRows **);
 extern void stoolap_stmt_finalize(StoolapStmt *);
 extern const char *stoolap_stmt_errmsg(const StoolapStmt *);
 extern int32_t stoolap_begin(StoolapDB *, StoolapTx **);
 extern int32_t stoolap_begin_with_isolation(StoolapDB *, int32_t, StoolapTx **);
 extern int32_t stoolap_tx_exec(StoolapTx *, const char *, int64_t *);
 extern int32_t stoolap_tx_exec_params(StoolapTx *, const char *, const StoolapValue *, int32_t, int64_t *);
-extern int32_t stoolap_tx_query(StoolapTx *, const char *, StoolapRows **);
-extern int32_t stoolap_tx_query_params(StoolapTx *, const char *, const StoolapValue *, int32_t, StoolapRows **);
 extern int32_t stoolap_tx_stmt_exec(StoolapTx *, const StoolapStmt *, const StoolapValue *, int32_t, int64_t *);
-extern int32_t stoolap_tx_stmt_query(StoolapTx *, const StoolapStmt *, const StoolapValue *, int32_t, StoolapRows **);
 extern int32_t stoolap_tx_commit(StoolapTx *);
 extern int32_t stoolap_tx_rollback(StoolapTx *);
 extern const char *stoolap_tx_errmsg(const StoolapTx *);
-extern int32_t stoolap_rows_fetch_all(StoolapRows *, uint8_t **, int64_t *);
-extern void stoolap_rows_close(StoolapRows *);
-extern const char *stoolap_rows_errmsg(const StoolapRows *);
-extern void stoolap_buffer_free(uint8_t *, int64_t);
+
+/* One-call queries: the packed buffer belongs to the db / stmt handle and
+ * stays valid until the next call on it. Must NOT be freed. */
+extern int32_t stoolap_query_params_all(StoolapDB *, StoolapTx *, const char *, const StoolapValue *, int32_t, const uint8_t **, int64_t *);
+extern int32_t stoolap_query_named_all(StoolapDB *, StoolapTx *, const char *, const StoolapNamedParam *, int32_t, const uint8_t **, int64_t *);
+extern int32_t stoolap_stmt_query_all(StoolapStmt *, StoolapTx *, const StoolapValue *, int32_t, const uint8_t **, int64_t *);
+extern int32_t stoolap_exec_named(StoolapDB *, const char *, const StoolapNamedParam *, int32_t, int64_t *);
+extern int32_t stoolap_tx_exec_named(StoolapTx *, const char *, const StoolapNamedParam *, int32_t, int64_t *);
 
 /* ================================================================
  * Daemon limits

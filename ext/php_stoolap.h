@@ -4,13 +4,12 @@
 extern zend_module_entry stoolap_module_entry;
 #define phpext_stoolap_ptr &stoolap_module_entry
 
-#define PHP_STOOLAP_VERSION "0.4.2"
+#define PHP_STOOLAP_VERSION "0.5.0-beta.1"
 
 /* Stoolap C API types */
 typedef struct StoolapDB StoolapDB;
 typedef struct StoolapStmt StoolapStmt;
 typedef struct StoolapTx StoolapTx;
-typedef struct StoolapRows StoolapRows;
 
 typedef struct StoolapValue {
     int32_t value_type;

@@ -710,30 +710,19 @@ static void tx_rollback_all(conn_t *c)
 }
 
 /* ================================================================
- * Query helper — fetch all rows and write buffer to SHM_RESP
+ * Query helper — write a one-call query result to SHM_RESP
+ *
+ * buf belongs to the db / stmt handle that produced it (no free);
+ * err must be read from that handle before any other call on it.
  * ================================================================ */
 
-static void fetch_rows_to_response(conn_t *c, StoolapRows *rows)
+static void write_query_result(conn_t *c, int32_t rc, const uint8_t *buf, int64_t buf_len,
+                               const char *err)
 {
-    uint8_t *buf = NULL;
-    int64_t  buf_len = 0;
-
-    int32_t rc = stoolap_rows_fetch_all(rows, &buf, &buf_len);
     if (rc != 0) {
-        const char *err = stoolap_rows_errmsg(rows);
-        stoolap_rows_close(rows);
-        write_error(c, err ? err : "rows fetch failed");
-        return;
-    }
-
-    stoolap_rows_close(rows);
-
-    if (buf && buf_len > 0) {
-        write_ok_buffer(c, buf, buf_len);
-        stoolap_buffer_free(buf, buf_len);
+        write_error(c, err ? err : "query failed");
     } else {
-        /* Empty result set — write zero-length OK response */
-        write_ok_buffer(c, (const uint8_t *)"", 0);
+        write_ok_buffer(c, buf_len > 0 ? buf : (const uint8_t *)"", buf_len);
     }
 }
 
@@ -824,13 +813,10 @@ static void handle_request(conn_t *c)
             write_error(c, "OP_QUERY: missing SQL");
             break;
         }
-        StoolapRows *rows = NULL;
-        int32_t rc = stoolap_query(c->db, sql, &rows);
-        if (rc != 0) {
-            write_error(c, stoolap_errmsg(c->db));
-        } else {
-            fetch_rows_to_response(c, rows);
-        }
+        const uint8_t *buf = NULL;
+        int64_t buf_len = 0;
+        int32_t rc = stoolap_query_params_all(c->db, NULL, sql, NULL, 0, &buf, &buf_len);
+        write_query_result(c, rc, buf, buf_len, rc ? stoolap_errmsg(c->db) : NULL);
         break;
     }
 
@@ -859,13 +845,10 @@ static void handle_request(conn_t *c)
             }
         }
 
-        StoolapRows *rows = NULL;
-        int32_t rc = stoolap_query_params(c->db, sql, c->params, (int32_t)pcount, &rows);
-        if (rc != 0) {
-            write_error(c, stoolap_errmsg(c->db));
-        } else {
-            fetch_rows_to_response(c, rows);
-        }
+        const uint8_t *buf = NULL;
+        int64_t buf_len = 0;
+        int32_t rc = stoolap_query_params_all(c->db, NULL, sql, c->params, (int32_t)pcount, &buf, &buf_len);
+        write_query_result(c, rc, buf, buf_len, rc ? stoolap_errmsg(c->db) : NULL);
         break;
     }
 
@@ -946,13 +929,10 @@ static void handle_request(conn_t *c)
             }
         }
 
-        StoolapRows *rows = NULL;
-        int32_t rc = stoolap_stmt_query(stmt, c->params, (int32_t)pcount, &rows);
-        if (rc != 0) {
-            write_error(c, stoolap_stmt_errmsg(stmt));
-        } else {
-            fetch_rows_to_response(c, rows);
-        }
+        const uint8_t *buf = NULL;
+        int64_t buf_len = 0;
+        int32_t rc = stoolap_stmt_query_all(stmt, NULL, c->params, (int32_t)pcount, &buf, &buf_len);
+        write_query_result(c, rc, buf, buf_len, rc ? stoolap_stmt_errmsg(stmt) : NULL);
         break;
     }
 
@@ -1090,13 +1070,10 @@ static void handle_request(conn_t *c)
             break;
         }
 
-        StoolapRows *rows = NULL;
-        int32_t rc = stoolap_tx_query(tx, sql, &rows);
-        if (rc != 0) {
-            write_error(c, stoolap_tx_errmsg(tx));
-        } else {
-            fetch_rows_to_response(c, rows);
-        }
+        const uint8_t *buf = NULL;
+        int64_t buf_len = 0;
+        int32_t rc = stoolap_query_params_all(c->db, tx, sql, NULL, 0, &buf, &buf_len);
+        write_query_result(c, rc, buf, buf_len, rc ? stoolap_errmsg(c->db) : NULL);
         break;
     }
 
@@ -1132,13 +1109,10 @@ static void handle_request(conn_t *c)
             }
         }
 
-        StoolapRows *rows = NULL;
-        int32_t rc = stoolap_tx_query_params(tx, sql, c->params, (int32_t)pcount, &rows);
-        if (rc != 0) {
-            write_error(c, stoolap_tx_errmsg(tx));
-        } else {
-            fetch_rows_to_response(c, rows);
-        }
+        const uint8_t *buf = NULL;
+        int64_t buf_len = 0;
+        int32_t rc = stoolap_query_params_all(c->db, tx, sql, c->params, (int32_t)pcount, &buf, &buf_len);
+        write_query_result(c, rc, buf, buf_len, rc ? stoolap_errmsg(c->db) : NULL);
         break;
     }
 
@@ -1255,13 +1229,10 @@ static void handle_request(conn_t *c)
             }
         }
 
-        StoolapRows *rows = NULL;
-        int32_t rc = stoolap_tx_stmt_query(tx, stmt, c->params, (int32_t)pcount, &rows);
-        if (rc != 0) {
-            write_error(c, stoolap_tx_errmsg(tx));
-        } else {
-            fetch_rows_to_response(c, rows);
-        }
+        const uint8_t *buf = NULL;
+        int64_t buf_len = 0;
+        int32_t rc = stoolap_stmt_query_all(stmt, tx, c->params, (int32_t)pcount, &buf, &buf_len);
+        write_query_result(c, rc, buf, buf_len, rc ? stoolap_stmt_errmsg(stmt) : NULL);
         break;
     }
 
