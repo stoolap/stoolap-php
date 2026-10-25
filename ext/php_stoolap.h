@@ -10,6 +10,7 @@ extern zend_module_entry stoolap_module_entry;
 typedef struct StoolapDB StoolapDB;
 typedef struct StoolapStmt StoolapStmt;
 typedef struct StoolapTx StoolapTx;
+typedef struct StoolapRows StoolapRows;
 
 typedef struct StoolapValue {
     int32_t value_type;

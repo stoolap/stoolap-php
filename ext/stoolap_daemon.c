@@ -93,6 +93,11 @@ typedef struct {
     StoolapTx *tx;
 } tx_slot_t;
 
+typedef struct {
+    uint32_t     id;    /* user-facing handle ID, 0 = unused */
+    StoolapRows *rows;
+} cursor_slot_t;
+
 /* ================================================================
  * Per-connection state
  * ================================================================ */
@@ -116,6 +121,11 @@ typedef struct {
     tx_slot_t    txs[DAEMON_MAX_TXS];
     uint32_t     tx_count;
     uint32_t     next_tx_id;
+
+    /* Open cursors */
+    cursor_slot_t cursors[DAEMON_MAX_CURSORS];
+    uint32_t     cursor_count;
+    uint32_t     next_cursor_id;
 } conn_t;
 
 /* ================================================================
@@ -707,6 +717,82 @@ static void tx_rollback_all(conn_t *c)
         }
     }
     c->tx_count = 0;
+}
+
+/* ================================================================
+ * Cursor slot management
+ * ================================================================ */
+
+static cursor_slot_t *cursor_alloc(conn_t *c, StoolapRows *rows, uint32_t *out_id)
+{
+    if (c->cursor_count >= DAEMON_MAX_CURSORS) return NULL;
+
+    for (uint32_t i = 0; i < DAEMON_MAX_CURSORS; i++) {
+        if (c->cursors[i].id == 0) {
+            c->next_cursor_id++;
+            if (c->next_cursor_id == 0) c->next_cursor_id = 1;
+            c->cursors[i].id   = c->next_cursor_id;
+            c->cursors[i].rows = rows;
+            c->cursor_count++;
+            *out_id = c->cursors[i].id;
+            return &c->cursors[i];
+        }
+    }
+    return NULL;
+}
+
+static StoolapRows *cursor_find(conn_t *c, uint32_t id)
+{
+    if (id == 0) return NULL;
+    for (uint32_t i = 0; i < DAEMON_MAX_CURSORS; i++) {
+        if (c->cursors[i].id == id) {
+            return c->cursors[i].rows;
+        }
+    }
+    return NULL;
+}
+
+static int cursor_remove(conn_t *c, uint32_t id)
+{
+    if (id == 0) return -1;
+    for (uint32_t i = 0; i < DAEMON_MAX_CURSORS; i++) {
+        if (c->cursors[i].id == id) {
+            stoolap_rows_close(c->cursors[i].rows);
+            c->cursors[i].id   = 0;
+            c->cursors[i].rows = NULL;
+            c->cursor_count--;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static void cursor_free_all(conn_t *c)
+{
+    for (uint32_t i = 0; i < DAEMON_MAX_CURSORS; i++) {
+        if (c->cursors[i].id != 0) {
+            stoolap_rows_close(c->cursors[i].rows);
+            c->cursors[i].id   = 0;
+            c->cursors[i].rows = NULL;
+        }
+    }
+    c->cursor_count = 0;
+}
+
+/* Register the rows of a cursor query and answer with its id */
+static void write_cursor_result(conn_t *c, int32_t rc, StoolapRows *rows, const char *err)
+{
+    if (rc != 0) {
+        write_error(c, err ? err : "query failed");
+        return;
+    }
+    uint32_t cid = 0;
+    if (!cursor_alloc(c, rows, &cid)) {
+        stoolap_rows_close(rows);
+        write_error(c, "too many open cursors");
+        return;
+    }
+    write_ok_u32(c, cid);
 }
 
 /* ================================================================
@@ -1373,6 +1459,118 @@ static void handle_request(conn_t *c)
         break;
     }
 
+    /* OP_CURSOR_QUERY: u32 sql_len + sql + u32 param_count + params → u32 cursor_id */
+    case OP_CURSOR_QUERY: {
+        const char *sql = read_sql(req, req_len, &off);
+        if (!sql) {
+            write_error(c, "OP_CURSOR_QUERY: bad SQL");
+            break;
+        }
+        if (off + 4 > req_len) {
+            write_error(c, "OP_CURSOR_QUERY: missing param count");
+            break;
+        }
+        uint32_t pcount = rd_u32(req + off); off += 4;
+        if (pcount > 0 && deserialize_params(c, req, req_len, &off, pcount) < 0) {
+            write_error(c, "OP_CURSOR_QUERY: bad params");
+            break;
+        }
+        StoolapRows *rows = NULL;
+        int32_t rc = stoolap_query_params(c->db, sql, c->params, (int32_t)pcount, &rows);
+        write_cursor_result(c, rc, rows, rc ? stoolap_errmsg(c->db) : NULL);
+        break;
+    }
+
+    /* OP_CURSOR_TX_QUERY: u32 tx_id + u32 sql_len + sql + u32 param_count + params → u32 cursor_id */
+    case OP_CURSOR_TX_QUERY: {
+        if (req_len < 8) {
+            write_error(c, "OP_CURSOR_TX_QUERY: truncated");
+            break;
+        }
+        uint32_t tid = rd_u32(req + off); off += 4;
+        StoolapTx *tx = tx_find(c, tid);
+        if (!tx) {
+            write_error(c, "OP_CURSOR_TX_QUERY: invalid tx_id");
+            break;
+        }
+        const char *sql = read_sql(req, req_len, &off);
+        if (!sql) {
+            write_error(c, "OP_CURSOR_TX_QUERY: bad SQL");
+            break;
+        }
+        if (off + 4 > req_len) {
+            write_error(c, "OP_CURSOR_TX_QUERY: missing param count");
+            break;
+        }
+        uint32_t pcount = rd_u32(req + off); off += 4;
+        if (pcount > 0 && deserialize_params(c, req, req_len, &off, pcount) < 0) {
+            write_error(c, "OP_CURSOR_TX_QUERY: bad params");
+            break;
+        }
+        StoolapRows *rows = NULL;
+        int32_t rc = stoolap_tx_query_params(tx, sql, c->params, (int32_t)pcount, &rows);
+        write_cursor_result(c, rc, rows, rc ? stoolap_tx_errmsg(tx) : NULL);
+        break;
+    }
+
+    /* OP_CURSOR_STMT_QUERY: u32 stmt_id + u32 param_count + params → u32 cursor_id */
+    case OP_CURSOR_STMT_QUERY: {
+        if (req_len < 8) {
+            write_error(c, "OP_CURSOR_STMT_QUERY: truncated");
+            break;
+        }
+        uint32_t sid = rd_u32(req + off); off += 4;
+        uint32_t pcount = rd_u32(req + off); off += 4;
+        StoolapStmt *stmt = stmt_find(c, sid);
+        if (!stmt) {
+            write_error(c, "OP_CURSOR_STMT_QUERY: invalid stmt_id");
+            break;
+        }
+        if (pcount > 0 && deserialize_params(c, req, req_len, &off, pcount) < 0) {
+            write_error(c, "OP_CURSOR_STMT_QUERY: bad params");
+            break;
+        }
+        StoolapRows *rows = NULL;
+        int32_t rc = stoolap_stmt_query(stmt, c->params, (int32_t)pcount, &rows);
+        write_cursor_result(c, rc, rows, rc ? stoolap_stmt_errmsg(stmt) : NULL);
+        break;
+    }
+
+    /* OP_CURSOR_FETCH: u32 cursor_id + i32 max_rows → binary buffer */
+    case OP_CURSOR_FETCH: {
+        if (req_len < 8) {
+            write_error(c, "OP_CURSOR_FETCH: truncated");
+            break;
+        }
+        uint32_t cid = rd_u32(req + off); off += 4;
+        int32_t max_rows = rd_i32(req + off);
+        StoolapRows *rows = cursor_find(c, cid);
+        if (!rows) {
+            write_error(c, "OP_CURSOR_FETCH: invalid cursor_id");
+            break;
+        }
+        const uint8_t *buf = NULL;
+        int64_t buf_len = 0;
+        int32_t n = 0;
+        int32_t rc = stoolap_rows_fetch_chunk(rows, max_rows, &buf, &buf_len, &n);
+        write_query_result(c, rc, buf, buf_len, rc ? stoolap_rows_errmsg(rows) : NULL);
+        break;
+    }
+
+    /* OP_CURSOR_CLOSE: u32 cursor_id → OK */
+    case OP_CURSOR_CLOSE: {
+        if (req_len < 4) {
+            write_error(c, "OP_CURSOR_CLOSE: truncated");
+            break;
+        }
+        if (cursor_remove(c, rd_u32(req + off)) != 0) {
+            write_error(c, "OP_CURSOR_CLOSE: invalid cursor_id");
+        } else {
+            write_ok_empty(c);
+        }
+        break;
+    }
+
     /* OP_VERSION: → string */
     case OP_VERSION: {
         const char *ver = stoolap_version();
@@ -1406,6 +1604,9 @@ static void handle_request(conn_t *c)
 static void conn_cleanup(conn_t *c)
 {
     LOG_DBG("cleaning up connection shm=%s", c->shm_name);
+
+    /* Close open cursors */
+    cursor_free_all(c);
 
     /* Rollback any open transactions */
     tx_rollback_all(c);

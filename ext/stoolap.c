@@ -34,10 +34,12 @@ static zend_class_entry *stoolap_database_ce;
 static zend_class_entry *stoolap_statement_ce;
 static zend_class_entry *stoolap_transaction_ce;
 static zend_class_entry *stoolap_exception_ce;
+static zend_class_entry *stoolap_cursor_ce;
 
 static zend_object_handlers stoolap_database_handlers;
 static zend_object_handlers stoolap_statement_handlers;
 static zend_object_handlers stoolap_transaction_handlers;
+static zend_object_handlers stoolap_cursor_handlers;
 
 static zend_class_entry *datetime_interface_ce;
 
@@ -61,6 +63,8 @@ typedef struct {
  * Object structs
  * ================================================================ */
 
+typedef struct stoolap_cursor_obj stoolap_cursor_obj;
+
 typedef struct {
     StoolapDB *db;           /* NULL when proxied */
     int proxy_fd;             /* Unix socket fd, -1 = direct */
@@ -68,6 +72,7 @@ typedef struct {
     char shm_name[32];        /* for shm_unlink */
     char dsn[256];            /* stored DSN for clone support */
     row_shape shape;          /* last ad hoc result layout (Database + Transaction queries) */
+    stoolap_cursor_obj *cursors; /* open cursors of Database, Transaction and Statement queries */
     zend_object std;
 } stoolap_db_obj;
 
@@ -92,6 +97,25 @@ typedef struct {
     zend_object std;
 } stoolap_tx_obj;
 
+/* A result read in packed chunks. The owner (Database, Transaction or
+ * Statement) is kept alive by owner_zv. Every cursor is listed on its
+ * Database, which closes them all on close; a Transaction or Statement
+ * closes its own on commit, rollback or finalize. */
+struct stoolap_cursor_obj {
+    StoolapRows *rows;         /* direct mode, NULL once released */
+    uint32_t proxy_cursor_id;  /* daemon mode, 0 once released */
+    stoolap_db_obj *proxy_db;  /* daemon connection, kept alive through owner_zv */
+    stoolap_cursor_obj **list; /* owner's list head, NULL once unlinked */
+    stoolap_cursor_obj *prev, *next;
+    zval owner_zv;
+    row_shape shape;
+    zval chunk;                /* rows of the current chunk */
+    uint32_t pos;              /* next row in chunk */
+    int32_t chunk_size;
+    zend_long key;
+    zend_object std;
+};
+
 /* Object-from-zend_object macros */
 static inline stoolap_db_obj *stoolap_db_from_obj(zend_object *obj) {
     return (stoolap_db_obj *)((char *)obj - XtOffsetOf(stoolap_db_obj, std));
@@ -102,10 +126,14 @@ static inline stoolap_stmt_obj *stoolap_stmt_from_obj(zend_object *obj) {
 static inline stoolap_tx_obj *stoolap_tx_from_obj(zend_object *obj) {
     return (stoolap_tx_obj *)((char *)obj - XtOffsetOf(stoolap_tx_obj, std));
 }
+static inline stoolap_cursor_obj *stoolap_cursor_from_obj(zend_object *obj) {
+    return (stoolap_cursor_obj *)((char *)obj - XtOffsetOf(stoolap_cursor_obj, std));
+}
 
 #define Z_STOOLAP_DB_P(zv) stoolap_db_from_obj(Z_OBJ_P(zv))
 #define Z_STOOLAP_STMT_P(zv) stoolap_stmt_from_obj(Z_OBJ_P(zv))
 #define Z_STOOLAP_TX_P(zv) stoolap_tx_from_obj(Z_OBJ_P(zv))
+#define Z_STOOLAP_CURSOR_P(zv) stoolap_cursor_from_obj(Z_OBJ_P(zv))
 
 #define PROXY_ACTIVE(obj) ((obj)->proxy_fd >= 0)
 #define DB_IS_OPEN(obj)   ((obj)->db != NULL || PROXY_ACTIVE(obj))
@@ -341,9 +369,10 @@ static void build_raw_row(uint32_t col_count, const uint8_t *buf, size_t *off, z
  *
  * QUERY_ASSOC: list of assoc rows; QUERY_ONE: first row or NULL;
  * QUERY_RAW: ['columns' => [...], 'rows' => [[...], ...]].
+ * (QUERY_CURSOR makes the query methods open a Cursor instead.)
  * ================================================================ */
 
-enum { QUERY_ASSOC = 0, QUERY_ONE = 1, QUERY_RAW = 2 };
+enum { QUERY_ASSOC = 0, QUERY_ONE = 1, QUERY_RAW = 2, QUERY_CURSOR = 3 };
 
 static void parse_result(row_shape *s, const uint8_t *buf, size_t buf_len, int mode, zval *return_value)
 {
@@ -1408,6 +1437,215 @@ static int32_t proxy_write_params(uint8_t *buf, size_t max_len,
 }
 
 /* ================================================================
+ * Cursors
+ *
+ * Rows arrive in chunks of 32, doubling up to 256, so a large result is
+ * never held in memory at once and the engine (or daemon) is called once
+ * per chunk. A cursor closes itself at the end of the result or of the
+ * foreach that reads it; its owner closes it on close, commit, rollback
+ * or finalize.
+ * ================================================================ */
+
+#define CURSOR_FIRST_CHUNK 32
+#define CURSOR_MAX_CHUNK   256
+
+/* Close the engine (or daemon) side of the result. Rows already in the
+ * current chunk are kept. */
+static void cursor_release(stoolap_cursor_obj *cur)
+{
+    if (cur->rows) {
+        stoolap_rows_close(cur->rows);
+        cur->rows = NULL;
+    } else if (cur->proxy_cursor_id) {
+        if (PROXY_ACTIVE(cur->proxy_db)) {
+            memcpy(SHM_REQ(cur->proxy_db->shm_base), &cur->proxy_cursor_id, 4);
+            SHM_CTL(cur->proxy_db->shm_base)->opcode = OP_CURSOR_CLOSE;
+            SHM_CTL(cur->proxy_db->shm_base)->req_len = 4;
+            proxy_roundtrip(cur->proxy_db); /* best-effort */
+        }
+        cur->proxy_cursor_id = 0;
+    }
+}
+
+/* Release, unlink from the owner and drop the current chunk: iteration
+ * ends at once */
+static void cursor_close(stoolap_cursor_obj *cur)
+{
+    cursor_release(cur);
+    if (cur->list) {
+        if (cur->prev) cur->prev->next = cur->next;
+        else *cur->list = cur->next;
+        if (cur->next) cur->next->prev = cur->prev;
+        cur->list = NULL;
+        cur->prev = cur->next = NULL;
+    }
+    zval_ptr_dtor(&cur->chunk);
+    ZVAL_UNDEF(&cur->chunk);
+    cur->pos = 0;
+}
+
+static void cursor_close_all(stoolap_cursor_obj **list)
+{
+    while (*list) {
+        cursor_close(*list);
+    }
+}
+
+/* Close the cursors of one Transaction or Statement */
+static void cursor_close_owned(stoolap_db_obj *dobj, zend_object *owner)
+{
+    stoolap_cursor_obj *cur = dobj->cursors;
+    while (cur) {
+        stoolap_cursor_obj *next = cur->next;
+        if (Z_OBJ(cur->owner_zv) == owner) cursor_close(cur);
+        cur = next;
+    }
+}
+
+/* Wrap an open result in a Cursor linked to its Database */
+static void cursor_new(zval *return_value, zval *owner, stoolap_cursor_obj **list,
+                       StoolapRows *rows, stoolap_db_obj *proxy_db, uint32_t proxy_cursor_id)
+{
+    object_init_ex(return_value, stoolap_cursor_ce);
+    stoolap_cursor_obj *cur = Z_STOOLAP_CURSOR_P(return_value);
+    cur->rows = rows;
+    cur->proxy_db = proxy_db;
+    cur->proxy_cursor_id = proxy_cursor_id;
+    ZVAL_COPY(&cur->owner_zv, owner);
+    cur->list = list;
+    cur->next = *list;
+    if (*list) (*list)->prev = cur;
+    *list = cur;
+}
+
+/* Load the next chunk. Returns 1 when it has rows, 0 at the end of the
+ * result or on error (exception thrown). */
+static int cursor_fetch(stoolap_cursor_obj *cur)
+{
+    zval_ptr_dtor(&cur->chunk);
+    ZVAL_UNDEF(&cur->chunk);
+    cur->pos = 0;
+
+    const uint8_t *buf;
+    size_t buf_len;
+    if (cur->rows) {
+        int64_t len = 0;
+        int32_t n = 0;
+        if (stoolap_rows_fetch_chunk(cur->rows, cur->chunk_size, &buf, &len, &n) != 0) {
+            const char *err = stoolap_rows_errmsg(cur->rows);
+            zend_throw_exception(stoolap_exception_ce, err && *err ? err : "cursor fetch failed", 0);
+            cursor_release(cur);
+            return 0;
+        }
+        buf_len = (size_t)len;
+    } else if (cur->proxy_cursor_id && PROXY_ACTIVE(cur->proxy_db)) {
+        stoolap_db_obj *dobj = cur->proxy_db;
+        uint8_t *req = SHM_REQ(dobj->shm_base);
+        memcpy(req, &cur->proxy_cursor_id, 4);
+        memcpy(req + 4, &cur->chunk_size, 4);
+        SHM_CTL(dobj->shm_base)->opcode = OP_CURSOR_FETCH;
+        SHM_CTL(dobj->shm_base)->req_len = 8;
+        if (proxy_roundtrip(dobj) != 0) {
+            zend_throw_exception(stoolap_exception_ce, "daemon communication error", 0);
+            cur->proxy_cursor_id = 0;
+            cursor_release(cur);
+            return 0;
+        }
+        if (SHM_CTL(dobj->shm_base)->resp_status != RESP_OK) {
+            proxy_throw_error(dobj);
+            cursor_release(cur);
+            return 0;
+        }
+        buf = SHM_RESP(dobj->shm_base);
+        buf_len = SHM_CTL(dobj->shm_base)->resp_len;
+    } else {
+        return 0;
+    }
+
+    parse_result(&cur->shape, buf, buf_len, QUERY_ASSOC, &cur->chunk);
+    uint32_t n = zend_hash_num_elements(Z_ARRVAL(cur->chunk));
+    if (n < (uint32_t)cur->chunk_size) {
+        cursor_release(cur); /* a short chunk is the last one */
+    } else {
+        if (cur->chunk_size < CURSOR_MAX_CHUNK) cur->chunk_size *= 2;
+        if (cur->proxy_db) {
+            /* Daemon: size the next chunk from this one's row width so it
+             * stays within half of the shared memory response buffer */
+            size_t fit = (SHM_RESP_MAX / 2) / (buf_len / n + 1);
+            if (fit < 1) fit = 1;
+            if ((size_t)cur->chunk_size > fit) cur->chunk_size = (int32_t)fit;
+        }
+    }
+    return n > 0;
+}
+
+/* ---- foreach support ---- */
+
+static void cursor_it_dtor(zend_object_iterator *it)
+{
+    cursor_close(Z_STOOLAP_CURSOR_P(&it->data));
+    zval_ptr_dtor(&it->data);
+}
+
+static int cursor_it_valid(zend_object_iterator *it)
+{
+    stoolap_cursor_obj *cur = Z_STOOLAP_CURSOR_P(&it->data);
+    if (Z_TYPE(cur->chunk) == IS_ARRAY && cur->pos < zend_hash_num_elements(Z_ARRVAL(cur->chunk))) {
+        return SUCCESS;
+    }
+    return cursor_fetch(cur) ? SUCCESS : FAILURE;
+}
+
+static zval *cursor_it_get_current_data(zend_object_iterator *it)
+{
+    /* InternalIterator::current() does not call valid() first */
+    if (cursor_it_valid(it) != SUCCESS) return NULL;
+    stoolap_cursor_obj *cur = Z_STOOLAP_CURSOR_P(&it->data);
+    return zend_hash_index_find(Z_ARRVAL(cur->chunk), cur->pos);
+}
+
+static void cursor_it_get_current_key(zend_object_iterator *it, zval *key)
+{
+    ZVAL_LONG(key, Z_STOOLAP_CURSOR_P(&it->data)->key);
+}
+
+static void cursor_it_move_forward(zend_object_iterator *it)
+{
+    stoolap_cursor_obj *cur = Z_STOOLAP_CURSOR_P(&it->data);
+    cur->pos++;
+    cur->key++;
+}
+
+/* Forward-only: a second foreach continues where the first stopped */
+static void cursor_it_rewind(zend_object_iterator *it)
+{
+    (void)it;
+}
+
+static const zend_object_iterator_funcs cursor_iterator_funcs = {
+    .dtor = cursor_it_dtor,
+    .valid = cursor_it_valid,
+    .get_current_data = cursor_it_get_current_data,
+    .get_current_key = cursor_it_get_current_key,
+    .move_forward = cursor_it_move_forward,
+    .rewind = cursor_it_rewind,
+};
+
+static zend_object_iterator *cursor_get_iterator(zend_class_entry *ce, zval *object, int by_ref)
+{
+    (void)ce;
+    if (by_ref) {
+        zend_throw_exception(stoolap_exception_ce, "Cursor rows cannot be iterated by reference", 0);
+        return NULL;
+    }
+    zend_object_iterator *it = emalloc(sizeof(zend_object_iterator));
+    zend_iterator_init(it);
+    ZVAL_OBJ_COPY(&it->data, Z_OBJ_P(object));
+    it->funcs = &cursor_iterator_funcs;
+    return it;
+}
+
+/* ================================================================
  * Object create / free handlers
  * ================================================================ */
 
@@ -1419,6 +1657,7 @@ static zend_object *stoolap_db_create(zend_class_entry *ce)
     obj->shm_base = NULL;
     obj->shm_name[0] = '\0';
     obj->dsn[0] = '\0';
+    obj->cursors = NULL;
     zend_object_std_init(&obj->std, ce);
     obj->std.handlers = &stoolap_database_handlers;
     return &obj->std;
@@ -1427,6 +1666,7 @@ static zend_object *stoolap_db_create(zend_class_entry *ce)
 static void stoolap_db_free(zend_object *object)
 {
     stoolap_db_obj *obj = stoolap_db_from_obj(object);
+    cursor_close_all(&obj->cursors);
     if (PROXY_ACTIVE(obj)) {
         proxy_disconnect(obj);
     } else if (obj->db) {
@@ -1506,6 +1746,9 @@ static zend_object *stoolap_tx_create(zend_class_entry *ce)
 static void stoolap_tx_free(zend_object *object)
 {
     stoolap_tx_obj *obj = stoolap_tx_from_obj(object);
+    if (Z_TYPE(obj->db_zv) == IS_OBJECT) {
+        cursor_close_owned(Z_STOOLAP_DB_P(&obj->db_zv), object);
+    }
     if (obj->proxy_tx_id > 0 && Z_TYPE(obj->db_zv) == IS_OBJECT) {
         stoolap_db_obj *dobj = proxy_db_from_zv(&obj->db_zv);
         if (dobj && PROXY_ACTIVE(dobj)) {
@@ -1522,6 +1765,35 @@ static void stoolap_tx_free(zend_object *object)
     }
     zval_ptr_dtor(&obj->db_zv);
     ZVAL_UNDEF(&obj->db_zv);
+    zend_object_std_dtor(object);
+}
+
+static zend_object *stoolap_cursor_create(zend_class_entry *ce)
+{
+    stoolap_cursor_obj *obj = zend_object_alloc(sizeof(stoolap_cursor_obj), ce);
+    obj->rows = NULL;
+    obj->proxy_cursor_id = 0;
+    obj->proxy_db = NULL;
+    obj->list = NULL;
+    obj->prev = obj->next = NULL;
+    ZVAL_UNDEF(&obj->owner_zv);
+    memset(&obj->shape, 0, sizeof(obj->shape));
+    ZVAL_UNDEF(&obj->chunk);
+    obj->pos = 0;
+    obj->chunk_size = CURSOR_FIRST_CHUNK;
+    obj->key = 0;
+    zend_object_std_init(&obj->std, ce);
+    obj->std.handlers = &stoolap_cursor_handlers;
+    return &obj->std;
+}
+
+static void stoolap_cursor_free(zend_object *object)
+{
+    stoolap_cursor_obj *obj = stoolap_cursor_from_obj(object);
+    cursor_close(obj);
+    row_shape_free(&obj->shape);
+    zval_ptr_dtor(&obj->owner_zv);
+    ZVAL_UNDEF(&obj->owner_zv);
     zend_object_std_dtor(object);
 }
 
@@ -2158,7 +2430,10 @@ static void stoolap_db_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
         }
         const uint8_t *buf = NULL;
         int64_t buf_len = 0;
-        int32_t rc = stoolap_query_named_all(obj->db, NULL, actual_sql, np.items, np.count, &buf, &buf_len);
+        StoolapRows *rows = NULL;
+        int32_t rc = mode == QUERY_CURSOR
+            ? stoolap_query_named(obj->db, actual_sql, np.items, np.count, &rows)
+            : stoolap_query_named_all(obj->db, NULL, actual_sql, np.items, np.count, &buf, &buf_len);
         stoolap_named_free(&np);
         if (limited_sql) efree(limited_sql);
         if (clean_sql) efree(clean_sql);
@@ -2166,6 +2441,10 @@ static void stoolap_db_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
             const char *err = stoolap_errmsg(obj->db);
             zend_throw_exception(stoolap_exception_ce, err ? err : "query failed", 0);
             RETURN_THROWS();
+        }
+        if (mode == QUERY_CURSOR) {
+            cursor_new(return_value, ZEND_THIS, &obj->cursors, rows, NULL, 0);
+            return;
         }
         parse_result(&obj->shape, buf, (size_t)buf_len, mode, return_value);
         return;
@@ -2201,8 +2480,8 @@ static void stoolap_db_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
         size_t off = 0;
         uint8_t opcode;
 
-        if (has_params) {
-            /* OP_QUERY_PARAMS: [u32 sql_len][sql][u32 param_count][params...] */
+        if (has_params || mode == QUERY_CURSOR) {
+            /* OP_QUERY_PARAMS / OP_CURSOR_QUERY: [u32 sql_len][sql][u32 param_count][params...] */
             uint32_t slen = (uint32_t)final_sql_len + 1;
             memcpy(req + off, &slen, 4); off += 4;
             memcpy(req + off, final_sql, final_sql_len);
@@ -2230,7 +2509,7 @@ static void stoolap_db_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
                 RETURN_THROWS();
             }
             off += pw;
-            opcode = OP_QUERY_PARAMS;
+            opcode = mode == QUERY_CURSOR ? OP_CURSOR_QUERY : OP_QUERY_PARAMS;
         } else {
             /* OP_QUERY: [u32 sql_len][sql + null] */
             uint32_t slen = (uint32_t)final_sql_len;
@@ -2256,6 +2535,12 @@ static void stoolap_db_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
             proxy_throw_error(obj);
             RETURN_THROWS();
         }
+        if (mode == QUERY_CURSOR) {
+            uint32_t cid;
+            memcpy(&cid, SHM_RESP(obj->shm_base), 4);
+            cursor_new(return_value, ZEND_THIS, &obj->cursors, NULL, obj, cid);
+            return;
+        }
         parse_result(&obj->shape, SHM_RESP(obj->shm_base),
                      SHM_CTL(obj->shm_base)->resp_len, mode, return_value);
         return;
@@ -2274,7 +2559,10 @@ static void stoolap_db_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
 
     const uint8_t *buf = NULL;
     int64_t buf_len = 0;
-    int32_t rc = stoolap_query_params_all(obj->db, NULL, final_sql, sp.values, sp.count, &buf, &buf_len);
+    StoolapRows *rows = NULL;
+    int32_t rc = mode == QUERY_CURSOR
+        ? stoolap_query_params(obj->db, final_sql, sp.values, sp.count, &rows)
+        : stoolap_query_params_all(obj->db, NULL, final_sql, sp.values, sp.count, &buf, &buf_len);
 
     stoolap_params_free(&sp);
     if (rewritten_sql) efree(rewritten_sql);
@@ -2288,12 +2576,17 @@ static void stoolap_db_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
         RETURN_THROWS();
     }
 
+    if (mode == QUERY_CURSOR) {
+        cursor_new(return_value, ZEND_THIS, &obj->cursors, rows, NULL, 0);
+        return;
+    }
     parse_result(&obj->shape, buf, (size_t)buf_len, mode, return_value);
 }
 
 PHP_METHOD(Stoolap_Database, query) { stoolap_db_query_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, QUERY_ASSOC); }
 PHP_METHOD(Stoolap_Database, queryOne) { stoolap_db_query_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, QUERY_ONE); }
 PHP_METHOD(Stoolap_Database, queryRaw) { stoolap_db_query_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, QUERY_RAW); }
+PHP_METHOD(Stoolap_Database, iterate) { stoolap_db_query_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, QUERY_CURSOR); }
 
 PHP_METHOD(Stoolap_Database, prepare)
 {
@@ -2549,6 +2842,7 @@ PHP_METHOD(Stoolap_Database, close)
     ZEND_PARSE_PARAMETERS_NONE();
 
     stoolap_db_obj *obj = Z_STOOLAP_DB_P(ZEND_THIS);
+    cursor_close_all(&obj->cursors);
     if (PROXY_ACTIVE(obj)) {
         proxy_disconnect(obj);
     } else if (obj->db) {
@@ -2712,7 +3006,7 @@ static void stoolap_stmt_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
             RETURN_THROWS();
         }
         off += pw;
-        SHM_CTL(dobj->shm_base)->opcode = OP_STMT_QUERY;
+        SHM_CTL(dobj->shm_base)->opcode = mode == QUERY_CURSOR ? OP_CURSOR_STMT_QUERY : OP_STMT_QUERY;
         SHM_CTL(dobj->shm_base)->req_len = (uint32_t)off;
         if (proxy_roundtrip(dobj) != 0) {
             zend_throw_exception(stoolap_exception_ce, "daemon communication error", 0);
@@ -2722,6 +3016,12 @@ static void stoolap_stmt_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
             proxy_throw_error(dobj);
             RETURN_THROWS();
         }
+        if (mode == QUERY_CURSOR) {
+            uint32_t cid;
+            memcpy(&cid, SHM_RESP(dobj->shm_base), 4);
+            cursor_new(return_value, ZEND_THIS, &dobj->cursors, NULL, dobj, cid);
+            return;
+        }
         parse_result(&sobj->shape, SHM_RESP(dobj->shm_base),
                      SHM_CTL(dobj->shm_base)->resp_len, mode, return_value);
         return;
@@ -2730,7 +3030,10 @@ static void stoolap_stmt_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
     /* One call, the packed buffer belongs to the statement */
     const uint8_t *buf = NULL;
     int64_t buf_len = 0;
-    int32_t rc = stoolap_stmt_query_all(sobj->stmt, NULL, sp.values, sp.count, &buf, &buf_len);
+    StoolapRows *rows = NULL;
+    int32_t rc = mode == QUERY_CURSOR
+        ? stoolap_stmt_query(sobj->stmt, sp.values, sp.count, &rows)
+        : stoolap_stmt_query_all(sobj->stmt, NULL, sp.values, sp.count, &buf, &buf_len);
 
     stoolap_stmt_params_free(&sp);
 
@@ -2740,12 +3043,17 @@ static void stoolap_stmt_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
         RETURN_THROWS();
     }
 
+    if (mode == QUERY_CURSOR) {
+        cursor_new(return_value, ZEND_THIS, &Z_STOOLAP_DB_P(&sobj->db_zv)->cursors, rows, NULL, 0);
+        return;
+    }
     parse_result(&sobj->shape, buf, (size_t)buf_len, mode, return_value);
 }
 
 PHP_METHOD(Stoolap_Statement, query) { stoolap_stmt_query_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, QUERY_ASSOC); }
 PHP_METHOD(Stoolap_Statement, queryOne) { stoolap_stmt_query_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, QUERY_ONE); }
 PHP_METHOD(Stoolap_Statement, queryRaw) { stoolap_stmt_query_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, QUERY_RAW); }
+PHP_METHOD(Stoolap_Statement, iterate) { stoolap_stmt_query_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, QUERY_CURSOR); }
 
 PHP_METHOD(Stoolap_Statement, sql)
 {
@@ -2763,6 +3071,9 @@ PHP_METHOD(Stoolap_Statement, finalize)
     ZEND_PARSE_PARAMETERS_NONE();
 
     stoolap_stmt_obj *sobj = Z_STOOLAP_STMT_P(ZEND_THIS);
+    if (Z_TYPE(sobj->db_zv) == IS_OBJECT) {
+        cursor_close_owned(Z_STOOLAP_DB_P(&sobj->db_zv), Z_OBJ_P(ZEND_THIS));
+    }
     if (sobj->proxy_stmt_id > 0 && Z_TYPE(sobj->db_zv) == IS_OBJECT) {
         stoolap_db_obj *dobj = proxy_db_from_zv(&sobj->db_zv);
         if (dobj && PROXY_ACTIVE(dobj)) {
@@ -3039,14 +3350,21 @@ static void stoolap_tx_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
         }
         const uint8_t *buf = NULL;
         int64_t buf_len = 0;
-        int32_t rc = stoolap_query_named_all(obj->db, obj->tx, actual_sql, np.items, np.count, &buf, &buf_len);
+        StoolapRows *rows = NULL;
+        int32_t rc = mode == QUERY_CURSOR
+            ? stoolap_tx_query_named(obj->tx, actual_sql, np.items, np.count, &rows)
+            : stoolap_query_named_all(obj->db, obj->tx, actual_sql, np.items, np.count, &buf, &buf_len);
         stoolap_named_free(&np);
         if (limited_sql) efree(limited_sql);
         if (clean_sql) efree(clean_sql);
         if (rc != 0) {
-            const char *err = stoolap_errmsg(obj->db);
+            const char *err = mode == QUERY_CURSOR ? stoolap_tx_errmsg(obj->tx) : stoolap_errmsg(obj->db);
             zend_throw_exception(stoolap_exception_ce, err ? err : "tx query failed", 0);
             RETURN_THROWS();
+        }
+        if (mode == QUERY_CURSOR) {
+            cursor_new(return_value, ZEND_THIS, &Z_STOOLAP_DB_P(&obj->db_zv)->cursors, rows, NULL, 0);
+            return;
         }
         parse_result(&Z_STOOLAP_DB_P(&obj->db_zv)->shape, buf, (size_t)buf_len, mode, return_value);
         return;
@@ -3090,7 +3408,7 @@ static void stoolap_tx_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
         off += slen;
 
         uint8_t opcode;
-        if (has_params) {
+        if (has_params || mode == QUERY_CURSOR) {
             stoolap_params_t sp;
             if (stoolap_build_params(final_params, &sp) != SUCCESS) {
                 stoolap_params_free(&sp);
@@ -3113,7 +3431,7 @@ static void stoolap_tx_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
                 RETURN_THROWS();
             }
             off += pw;
-            opcode = OP_TX_QUERY_PARAMS;
+            opcode = mode == QUERY_CURSOR ? OP_CURSOR_TX_QUERY : OP_TX_QUERY_PARAMS;
         } else {
             opcode = OP_TX_QUERY;
         }
@@ -3133,6 +3451,12 @@ static void stoolap_tx_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
             proxy_throw_error(dobj);
             RETURN_THROWS();
         }
+        if (mode == QUERY_CURSOR) {
+            uint32_t cid;
+            memcpy(&cid, SHM_RESP(dobj->shm_base), 4);
+            cursor_new(return_value, ZEND_THIS, &dobj->cursors, NULL, dobj, cid);
+            return;
+        }
         parse_result(&dobj->shape, SHM_RESP(dobj->shm_base),
                      SHM_CTL(dobj->shm_base)->resp_len, mode, return_value);
         return;
@@ -3151,7 +3475,10 @@ static void stoolap_tx_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
 
     const uint8_t *buf = NULL;
     int64_t buf_len = 0;
-    int32_t rc = stoolap_query_params_all(obj->db, obj->tx, final_sql, sp.values, sp.count, &buf, &buf_len);
+    StoolapRows *rows = NULL;
+    int32_t rc = mode == QUERY_CURSOR
+        ? stoolap_tx_query_params(obj->tx, final_sql, sp.values, sp.count, &rows)
+        : stoolap_query_params_all(obj->db, obj->tx, final_sql, sp.values, sp.count, &buf, &buf_len);
 
     stoolap_params_free(&sp);
     if (rewritten_sql) efree(rewritten_sql);
@@ -3160,17 +3487,38 @@ static void stoolap_tx_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
     if (clean_sql) efree(clean_sql);
 
     if (rc != 0) {
-        const char *err = stoolap_errmsg(obj->db);
+        const char *err = mode == QUERY_CURSOR ? stoolap_tx_errmsg(obj->tx) : stoolap_errmsg(obj->db);
         zend_throw_exception(stoolap_exception_ce, err ? err : "tx query failed", 0);
         RETURN_THROWS();
     }
 
+    if (mode == QUERY_CURSOR) {
+        cursor_new(return_value, ZEND_THIS, &dobj->cursors, rows, NULL, 0);
+        return;
+    }
     parse_result(&dobj->shape, buf, (size_t)buf_len, mode, return_value);
 }
 
 PHP_METHOD(Stoolap_Transaction, query) { stoolap_tx_query_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, QUERY_ASSOC); }
 PHP_METHOD(Stoolap_Transaction, queryOne) { stoolap_tx_query_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, QUERY_ONE); }
 PHP_METHOD(Stoolap_Transaction, queryRaw) { stoolap_tx_query_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, QUERY_RAW); }
+PHP_METHOD(Stoolap_Transaction, iterate) { stoolap_tx_query_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, QUERY_CURSOR); }
+
+/* ================================================================
+ * Cursor methods
+ * ================================================================ */
+
+PHP_METHOD(Stoolap_Cursor, getIterator)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    zend_create_internal_iterator_zval(return_value, ZEND_THIS);
+}
+
+PHP_METHOD(Stoolap_Cursor, close)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    cursor_close(Z_STOOLAP_CURSOR_P(ZEND_THIS));
+}
 
 PHP_METHOD(Stoolap_Transaction, executeBatch)
 {
@@ -3470,6 +3818,7 @@ PHP_METHOD(Stoolap_Transaction, commit)
     if (!stoolap_tx_check_db(obj)) {
         RETURN_THROWS();
     }
+    cursor_close_owned(Z_STOOLAP_DB_P(&obj->db_zv), Z_OBJ_P(ZEND_THIS));
 
     /* Proxy path */
     stoolap_db_obj *dobj = proxy_db_from_zv(&obj->db_zv);
@@ -3514,6 +3863,7 @@ PHP_METHOD(Stoolap_Transaction, rollback)
     if (!stoolap_tx_check_db(obj)) {
         RETURN_THROWS();
     }
+    cursor_close_owned(Z_STOOLAP_DB_P(&obj->db_zv), Z_OBJ_P(ZEND_THIS));
 
     /* Proxy path */
     stoolap_db_obj *dobj = proxy_db_from_zv(&obj->db_zv);
@@ -3582,6 +3932,11 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_stoolap_db_query_one, 0, 1, IS_A
     ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, params, IS_ARRAY, 0, "[]")
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_stoolap_db_iterate, 0, 1, Stoolap\\Cursor, 0)
+    ZEND_ARG_TYPE_INFO(0, sql, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, params, IS_ARRAY, 0, "[]")
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_INFO_EX(arginfo_stoolap_db_prepare, 0, 0, 1)
     ZEND_ARG_TYPE_INFO(0, sql, IS_STRING, 0)
 ZEND_END_ARG_INFO()
@@ -3602,6 +3957,10 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_stoolap_stmt_query, 0, 0, IS_ARR
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_stoolap_stmt_query_one, 0, 0, IS_ARRAY, 1)
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, params, IS_ARRAY, 0, "[]")
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_stoolap_stmt_iterate, 0, 0, Stoolap\\Cursor, 0)
     ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, params, IS_ARRAY, 0, "[]")
 ZEND_END_ARG_INFO()
 
@@ -3642,6 +4001,13 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_stoolap_tx_rollback, 0, 0, IS_VOID, 0)
 ZEND_END_ARG_INFO()
 
+/* Cursor */
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_stoolap_cursor_get_iterator, 0, 0, Iterator, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_stoolap_cursor_close, 0, 0, IS_VOID, 0)
+ZEND_END_ARG_INFO()
+
 /* ================================================================
  * Method tables
  * ================================================================ */
@@ -3655,6 +4021,7 @@ static const zend_function_entry stoolap_database_methods[] = {
     PHP_ME(Stoolap_Database, query,           arginfo_stoolap_db_query,     ZEND_ACC_PUBLIC)
     PHP_ME(Stoolap_Database, queryOne,        arginfo_stoolap_db_query_one, ZEND_ACC_PUBLIC)
     PHP_ME(Stoolap_Database, queryRaw,        arginfo_stoolap_db_query,     ZEND_ACC_PUBLIC)
+    PHP_ME(Stoolap_Database, iterate,         arginfo_stoolap_db_iterate,   ZEND_ACC_PUBLIC)
     PHP_ME(Stoolap_Database, prepare,         arginfo_stoolap_db_prepare,   ZEND_ACC_PUBLIC)
     PHP_ME(Stoolap_Database, begin,           arginfo_stoolap_db_void,      ZEND_ACC_PUBLIC)
     PHP_ME(Stoolap_Database, beginSnapshot,   arginfo_stoolap_db_void,      ZEND_ACC_PUBLIC)
@@ -3669,6 +4036,7 @@ static const zend_function_entry stoolap_statement_methods[] = {
     PHP_ME(Stoolap_Statement, query,     arginfo_stoolap_stmt_query,     ZEND_ACC_PUBLIC)
     PHP_ME(Stoolap_Statement, queryOne,  arginfo_stoolap_stmt_query_one, ZEND_ACC_PUBLIC)
     PHP_ME(Stoolap_Statement, queryRaw,  arginfo_stoolap_stmt_query,     ZEND_ACC_PUBLIC)
+    PHP_ME(Stoolap_Statement, iterate,   arginfo_stoolap_stmt_iterate,   ZEND_ACC_PUBLIC)
     PHP_ME(Stoolap_Statement, sql,       arginfo_stoolap_stmt_sql,       ZEND_ACC_PUBLIC)
     PHP_ME(Stoolap_Statement, finalize,  arginfo_stoolap_stmt_finalize,  ZEND_ACC_PUBLIC)
     PHP_FE_END
@@ -3681,8 +4049,15 @@ static const zend_function_entry stoolap_transaction_methods[] = {
     PHP_ME(Stoolap_Transaction, query,        arginfo_stoolap_tx_query,         ZEND_ACC_PUBLIC)
     PHP_ME(Stoolap_Transaction, queryOne,  arginfo_stoolap_tx_query_one,ZEND_ACC_PUBLIC)
     PHP_ME(Stoolap_Transaction, queryRaw,  arginfo_stoolap_tx_query,    ZEND_ACC_PUBLIC)
+    PHP_ME(Stoolap_Transaction, iterate,   arginfo_stoolap_db_iterate,  ZEND_ACC_PUBLIC)
     PHP_ME(Stoolap_Transaction, commit,    arginfo_stoolap_tx_commit,   ZEND_ACC_PUBLIC)
     PHP_ME(Stoolap_Transaction, rollback,  arginfo_stoolap_tx_rollback, ZEND_ACC_PUBLIC)
+    PHP_FE_END
+};
+
+static const zend_function_entry stoolap_cursor_methods[] = {
+    PHP_ME(Stoolap_Cursor, getIterator, arginfo_stoolap_cursor_get_iterator, ZEND_ACC_PUBLIC)
+    PHP_ME(Stoolap_Cursor, close,       arginfo_stoolap_cursor_close,        ZEND_ACC_PUBLIC)
     PHP_FE_END
 };
 
@@ -3743,6 +4118,19 @@ PHP_MINIT_FUNCTION(stoolap)
     stoolap_transaction_handlers.offset = XtOffsetOf(stoolap_tx_obj, std);
     stoolap_transaction_handlers.free_obj = stoolap_tx_free;
     stoolap_transaction_handlers.clone_obj = NULL;
+
+    /* Cursor */
+    INIT_NS_CLASS_ENTRY(ce, "Stoolap", "Cursor", stoolap_cursor_methods);
+    stoolap_cursor_ce = zend_register_internal_class(&ce);
+    stoolap_cursor_ce->ce_flags |= ZEND_ACC_FINAL | ZEND_ACC_NO_DYNAMIC_PROPERTIES;
+    stoolap_cursor_ce->create_object = stoolap_cursor_create;
+    stoolap_cursor_ce->get_iterator = cursor_get_iterator;
+    zend_class_implements(stoolap_cursor_ce, 1, zend_ce_aggregate);
+
+    memcpy(&stoolap_cursor_handlers, &std_object_handlers, sizeof(zend_object_handlers));
+    stoolap_cursor_handlers.offset = XtOffsetOf(stoolap_cursor_obj, std);
+    stoolap_cursor_handlers.free_obj = stoolap_cursor_free;
+    stoolap_cursor_handlers.clone_obj = NULL;
 
     datetime_interface_ce = NULL;
 

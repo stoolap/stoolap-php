@@ -57,6 +57,11 @@ static inline void stoolap_daemon_init_paths(pid_t master_pid) {
 #define OP_TX_EXEC_BATCH    0x13  /* tx_id + sql + batch_count + params[] → i64 affected */
 #define OP_VERSION          0x14  /* → string */
 #define OP_CLOSE            0x15  /* → OK, daemon closes connection */
+#define OP_CURSOR_QUERY     0x16  /* sql + params → u32 cursor_id */
+#define OP_CURSOR_TX_QUERY  0x17  /* tx_id + sql + params → u32 cursor_id */
+#define OP_CURSOR_STMT_QUERY 0x18 /* stmt_id + params → u32 cursor_id */
+#define OP_CURSOR_FETCH     0x19  /* cursor_id + i32 max_rows → binary buffer (0 rows = done) */
+#define OP_CURSOR_CLOSE     0x1A  /* cursor_id → OK */
 
 /* ================================================================
  * Response status
@@ -221,6 +226,7 @@ static inline int shm_wake(volatile uint32_t *addr)
 typedef struct StoolapDB StoolapDB;
 typedef struct StoolapStmt StoolapStmt;
 typedef struct StoolapTx StoolapTx;
+typedef struct StoolapRows StoolapRows;
 
 typedef struct StoolapValue {
     int32_t value_type;
@@ -274,12 +280,24 @@ extern int32_t stoolap_stmt_query_all(StoolapStmt *, StoolapTx *, const StoolapV
 extern int32_t stoolap_exec_named(StoolapDB *, const char *, const StoolapNamedParam *, int32_t, int64_t *);
 extern int32_t stoolap_tx_exec_named(StoolapTx *, const char *, const StoolapNamedParam *, int32_t, int64_t *);
 
+/* Cursors: a StoolapRows handle read in packed chunks. The chunk buffer
+ * belongs to the rows handle and stays valid until the next call on it. */
+extern int32_t stoolap_query_params(StoolapDB *, const char *, const StoolapValue *, int32_t, StoolapRows **);
+extern int32_t stoolap_query_named(StoolapDB *, const char *, const StoolapNamedParam *, int32_t, StoolapRows **);
+extern int32_t stoolap_tx_query_params(StoolapTx *, const char *, const StoolapValue *, int32_t, StoolapRows **);
+extern int32_t stoolap_tx_query_named(StoolapTx *, const char *, const StoolapNamedParam *, int32_t, StoolapRows **);
+extern int32_t stoolap_stmt_query(StoolapStmt *, const StoolapValue *, int32_t, StoolapRows **);
+extern int32_t stoolap_rows_fetch_chunk(StoolapRows *, int32_t, const uint8_t **, int64_t *, int32_t *);
+extern void stoolap_rows_close(StoolapRows *);
+extern const char *stoolap_rows_errmsg(const StoolapRows *);
+
 /* ================================================================
  * Daemon limits
  * ================================================================ */
 
 #define DAEMON_MAX_STMTS   256
 #define DAEMON_MAX_TXS     64
+#define DAEMON_MAX_CURSORS 64
 #define DAEMON_MAX_PARAMS  1024
 #define DAEMON_MAX_DBS     256
 #define DAEMON_IDLE_SEC    30

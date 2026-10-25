@@ -2019,4 +2019,200 @@ class StoolapTest extends TestCase
             }
         }
     }
+
+    // ---- Cursors ----
+
+    private function seedCursorTable(int $rows): void
+    {
+        $this->db->exec('CREATE TABLE cur (id INTEGER PRIMARY KEY, name TEXT, score FLOAT)');
+        if ($rows > 0) {
+            $this->db->executeBatch(
+                'INSERT INTO cur VALUES ($1, $2, $3)',
+                array_map(fn($i) => [$i, "n$i", $i / 2], range(1, $rows))
+            );
+        }
+    }
+
+    public function testIterateReadsEveryRowAcrossChunks(): void
+    {
+        $this->seedCursorTable(1000);
+        $cursor = $this->db->iterate('SELECT * FROM cur ORDER BY id');
+        $this->assertInstanceOf(\Stoolap\Cursor::class, $cursor);
+        $this->assertInstanceOf(\IteratorAggregate::class, $cursor);
+
+        $rows = [];
+        foreach ($cursor as $key => $row) {
+            $rows[$key] = $row;
+        }
+        $this->assertSame($this->db->query('SELECT * FROM cur ORDER BY id'), $rows);
+    }
+
+    public function testIterateAtChunkBoundaries(): void
+    {
+        $this->seedCursorTable(0);
+        foreach ([0, 1, 31, 32, 33, 96, 97, 480, 736, 737] as $n) {
+            $this->db->exec('DELETE FROM cur');
+            if ($n > 0) {
+                $this->db->executeBatch('INSERT INTO cur VALUES ($1, $2, $3)', array_map(fn($i) => [$i, "n$i", 0.5], range(1, $n)));
+            }
+            $ids = array_column(iterator_to_array($this->db->iterate('SELECT id FROM cur ORDER BY id')), 'id');
+            $this->assertSame($n > 0 ? range(1, $n) : [], $ids, "rows: $n");
+        }
+    }
+
+    public function testIterateMatchesQueryOnEveryOwner(): void
+    {
+        $this->seedCursorTable(300);
+        $sqlPos = 'SELECT id, name FROM cur WHERE id > $1 ORDER BY id';
+        $sqlNamed = 'SELECT id, name FROM cur WHERE id > :min ORDER BY id';
+        $expected = $this->db->query($sqlPos, [50]);
+
+        $this->assertSame($expected, iterator_to_array($this->db->iterate($sqlPos, [50])));
+        $this->assertSame($expected, iterator_to_array($this->db->iterate($sqlNamed, ['min' => 50])));
+        $this->assertSame($expected, iterator_to_array($this->db->prepare($sqlPos)->iterate([50])));
+        $this->assertSame($expected, iterator_to_array($this->db->prepare($sqlNamed)->iterate(['min' => 50])));
+
+        $tx = $this->db->begin();
+        $this->assertSame($expected, iterator_to_array($tx->iterate($sqlPos, [50])));
+        $this->assertSame($expected, iterator_to_array($tx->iterate($sqlNamed, ['min' => 50])));
+        $tx->rollback();
+    }
+
+    public function testIterateInTransactionSeesOwnWrites(): void
+    {
+        $this->seedCursorTable(3);
+        $tx = $this->db->begin();
+        $tx->execute('INSERT INTO cur VALUES ($1, $2, $3)', [4, 'n4', 2.0]);
+        $ids = array_column(iterator_to_array($tx->iterate('SELECT id FROM cur ORDER BY id')), 'id');
+        $this->assertSame([1, 2, 3, 4], $ids);
+        $tx->rollback();
+    }
+
+    public function testIterateCursorClosesWhenLoopBreaks(): void
+    {
+        $this->seedCursorTable(100);
+        $cursor = $this->db->iterate('SELECT id FROM cur ORDER BY id');
+        foreach ($cursor as $row) {
+            break;
+        }
+        $this->assertSame([], iterator_to_array($cursor));
+
+        $cursor = $this->db->iterate('SELECT id FROM cur ORDER BY id');
+        $cursor->close();
+        $cursor->close();
+        $this->assertSame([], iterator_to_array($cursor));
+    }
+
+    public function testIterateCursorEndsOnCommitRollbackAndClose(): void
+    {
+        $this->seedCursorTable(100);
+        foreach (['commit', 'rollback'] as $end) {
+            $tx = $this->db->begin();
+            $seen = 0;
+            foreach ($tx->iterate('SELECT id FROM cur ORDER BY id') as $row) {
+                $seen++;
+                if ($seen === 2) {
+                    $tx->$end();
+                }
+            }
+            $this->assertSame(2, $seen, $end);
+        }
+
+        // A cursor whose rows all fit in its first chunk ends as well
+        $tx = $this->db->begin();
+        $seen = 0;
+        foreach ($tx->iterate('SELECT id FROM cur WHERE id <= 3') as $row) {
+            $seen++;
+            $tx->commit();
+        }
+        $this->assertSame(1, $seen);
+
+        $db = Database::open(':memory:');
+        $db->exec('CREATE TABLE t (id INTEGER)');
+        $db->exec('INSERT INTO t VALUES (1), (2), (3)');
+        $seen = 0;
+        foreach ($db->prepare('SELECT id FROM t')->iterate() as $row) {
+            $seen++;
+            $db->close();
+        }
+        $this->assertSame(1, $seen);
+
+        $db = Database::open('memory://cursor_tx_' . getmypid() . '_' . mt_rand());
+        $db->exec('CREATE TABLE t (id INTEGER)');
+        $db->exec('INSERT INTO t VALUES (1), (2), (3)');
+        $tx = $db->begin();
+        $seen = 0;
+        foreach ($tx->iterate('SELECT id FROM t') as $row) {
+            $seen++;
+            $db->close();
+        }
+        $this->assertSame(1, $seen);
+
+        $stmt = $this->db->prepare('SELECT id FROM cur ORDER BY id');
+        $seen = 0;
+        foreach ($stmt->iterate() as $row) {
+            $seen++;
+            $stmt->finalize();
+        }
+        $this->assertSame(1, $seen);
+    }
+
+    public function testIterateWideRows(): void
+    {
+        // 300 rows of 40KB: a 256-row chunk would not fit the daemon's 4MB response buffer
+        $this->db->exec('CREATE TABLE wide (id INTEGER PRIMARY KEY, body TEXT)');
+        $insert = $this->db->prepare('INSERT INTO wide VALUES ($1, $2)');
+        for ($i = 1; $i <= 300; $i++) {
+            $insert->execute([$i, str_repeat(chr(64 + $i % 26), 40000)]);
+        }
+        $count = 0;
+        foreach ($this->db->iterate('SELECT id, body FROM wide ORDER BY id') as $row) {
+            $count++;
+            $this->assertSame($count, $row['id']);
+            $this->assertSame(40000, strlen($row['body']));
+        }
+        $this->assertSame(300, $count);
+    }
+
+    public function testIterateInterleavedCursors(): void
+    {
+        $this->seedCursorTable(500);
+        $a = $this->db->iterate('SELECT id FROM cur ORDER BY id')->getIterator();
+        $b = $this->db->iterate('SELECT id FROM cur ORDER BY id DESC')->getIterator();
+        $pairs = [];
+        for ($a->rewind(), $b->rewind(); $a->valid() && $b->valid(); $a->next(), $b->next()) {
+            $pairs[] = $a->current()['id'] + $b->current()['id'];
+        }
+        $this->assertCount(500, $pairs);
+        $this->assertSame([501], array_unique($pairs));
+    }
+
+    public function testIterateErrors(): void
+    {
+        $this->seedCursorTable(100);
+        try {
+            $this->db->iterate('SELECT * FROM missing_table');
+            $this->fail('iterate did not throw');
+        } catch (StoolapException $e) {
+            $this->assertStringContainsString('missing_table', $e->getMessage());
+        }
+
+        try {
+            $this->db->iterate('SELECT id FROM cur WHERE id = :id', []);
+            $this->fail('missing named param did not throw');
+        } catch (StoolapException $e) {
+            $this->assertStringContainsString('id', $e->getMessage());
+        }
+
+        $seen = 0;
+        try {
+            foreach ($this->db->iterate('SELECT 9223372036854775807 + id AS x FROM cur') as $row) {
+                $seen++;
+            }
+            $this->fail('overflow did not throw');
+        } catch (StoolapException $e) {
+            $this->assertStringContainsString('overflow', $e->getMessage());
+        }
+        $this->assertSame(0, $seen);
+    }
 }
