@@ -50,6 +50,17 @@ jobs:
         working-directory: stoolap-engine
         run: cargo build --release --features ffi
 
+      - name: Strip debug info from the shared library
+        shell: bash
+        run: |
+          lib=stoolap-engine/target/release/${{ matrix.lib }}
+          case "${{ matrix.target }}" in
+            *apple-darwin) strip -x "$lib" ;;
+            *linux-gnu) strip "$lib" ;;
+            *) ;; # MSVC puts debug info in a separate .pdb
+          esac
+          ls -l "$lib"
+
       - name: Upload library
         uses: actions/upload-artifact@v4
         with:
