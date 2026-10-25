@@ -1355,6 +1355,14 @@ static int ensure_daemon_running(void)
 
 /* Serialize StoolapValue params into shm request buffer.
  * Returns bytes written, or -1 on overflow. */
+/* SQL and its framing must fit the shared memory request area */
+static int proxy_sql_fits(size_t sql_len)
+{
+    if (sql_len + 16 <= SHM_REQ_MAX) return 1;
+    zend_throw_exception(stoolap_exception_ce, "SQL too large for shared memory", 0);
+    return 0;
+}
+
 static int32_t proxy_write_params(uint8_t *buf, size_t max_len,
     const StoolapValue *values, int32_t count)
 {
@@ -1638,6 +1646,10 @@ PHP_METHOD(Stoolap_Database, exec)
     size_t actual_len = clean_sql ? clean_len : sql_len;
 
     if (PROXY_ACTIVE(obj)) {
+        if (!proxy_sql_fits(actual_len)) {
+            if (clean_sql) efree(clean_sql);
+            RETURN_THROWS();
+        }
         uint8_t *req = SHM_REQ(obj->shm_base);
         uint32_t slen = (uint32_t)actual_len;
         memcpy(req, &slen, 4);
@@ -1738,6 +1750,13 @@ PHP_METHOD(Stoolap_Database, execute)
     }
 
     if (PROXY_ACTIVE(obj)) {
+        if (!proxy_sql_fits(final_sql_len)) {
+            stoolap_params_free(&sp);
+            if (rewritten_sql) efree(rewritten_sql);
+            if (Z_TYPE(positional_params) != IS_UNDEF) zval_ptr_dtor(&positional_params);
+            if (clean_sql) efree(clean_sql);
+            RETURN_THROWS();
+        }
         uint8_t *req = SHM_REQ(obj->shm_base);
         size_t off = 0;
         uint32_t slen = (uint32_t)final_sql_len + 1; /* include null byte */
@@ -1849,6 +1868,14 @@ PHP_METHOD(Stoolap_Database, executeBatch)
 
     /* Proxy path for executeBatch: pre-allocate once, serialize all rows into shm */
     if (PROXY_ACTIVE(obj)) {
+        if (!proxy_sql_fits(final_sql_len)) {
+            if (param_names) {
+                for (uint32_t i = 0; i < param_name_count; i++) zend_string_release(param_names[i]);
+                efree(param_names);
+            }
+            if (clean_sql) efree(clean_sql);
+            RETURN_THROWS();
+        }
         uint8_t *req = SHM_REQ(obj->shm_base);
         size_t off = 0;
         uint32_t slen = (uint32_t)final_sql_len + 1;
@@ -2163,6 +2190,13 @@ static void stoolap_db_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
     zval *final_params = Z_TYPE(positional_params) != IS_UNDEF ? &positional_params : params;
 
     if (PROXY_ACTIVE(obj)) {
+        if (!proxy_sql_fits(final_sql_len)) {
+            if (rewritten_sql) efree(rewritten_sql);
+            if (Z_TYPE(positional_params) != IS_UNDEF) zval_ptr_dtor(&positional_params);
+            if (limited_sql) efree(limited_sql);
+            if (clean_sql) efree(clean_sql);
+            RETURN_THROWS();
+        }
         uint8_t *req = SHM_REQ(obj->shm_base);
         size_t off = 0;
         uint8_t opcode;
@@ -2291,6 +2325,15 @@ PHP_METHOD(Stoolap_Database, prepare)
     size_t prepare_sql_len = rewritten_sql ? strlen(rewritten_sql) : original_len;
 
     if (PROXY_ACTIVE(obj)) {
+        if (!proxy_sql_fits(prepare_sql_len)) {
+            if (rewritten_sql) efree(rewritten_sql);
+            if (clean_sql) efree(clean_sql);
+            if (param_names) {
+                for (uint32_t i = 0; i < param_name_count; i++) zend_string_release(param_names[i]);
+                efree(param_names);
+            }
+            RETURN_THROWS();
+        }
         uint8_t *req = SHM_REQ(obj->shm_base);
         uint32_t slen = (uint32_t)prepare_sql_len;
         memcpy(req, &slen, 4);
@@ -2778,6 +2821,10 @@ PHP_METHOD(Stoolap_Transaction, exec)
     /* Proxy path */
     stoolap_db_obj *dobj = proxy_db_from_zv(&obj->db_zv);
     if (dobj && PROXY_ACTIVE(dobj) && obj->proxy_tx_id > 0) {
+        if (!proxy_sql_fits(actual_len)) {
+            if (clean_sql) efree(clean_sql);
+            RETURN_THROWS();
+        }
         uint8_t *req = SHM_REQ(dobj->shm_base);
         size_t off = 0;
         memcpy(req + off, &obj->proxy_tx_id, 4); off += 4;
@@ -2885,6 +2932,13 @@ PHP_METHOD(Stoolap_Transaction, execute)
     /* Proxy path */
     stoolap_db_obj *dobj = proxy_db_from_zv(&obj->db_zv);
     if (dobj && PROXY_ACTIVE(dobj) && obj->proxy_tx_id > 0) {
+        if (!proxy_sql_fits(final_sql_len)) {
+            stoolap_params_free(&sp);
+            if (rewritten_sql) efree(rewritten_sql);
+            if (Z_TYPE(positional_params) != IS_UNDEF) zval_ptr_dtor(&positional_params);
+            if (clean_sql) efree(clean_sql);
+            RETURN_THROWS();
+        }
         uint8_t *req = SHM_REQ(dobj->shm_base);
         size_t off = 0;
         memcpy(req + off, &obj->proxy_tx_id, 4); off += 4;
@@ -3019,6 +3073,13 @@ static void stoolap_tx_query_impl(INTERNAL_FUNCTION_PARAMETERS, int mode)
     /* Proxy path */
     stoolap_db_obj *dobj = proxy_db_from_zv(&obj->db_zv);
     if (dobj && PROXY_ACTIVE(dobj) && obj->proxy_tx_id > 0) {
+        if (!proxy_sql_fits(final_sql_len)) {
+            if (rewritten_sql) efree(rewritten_sql);
+            if (Z_TYPE(positional_params) != IS_UNDEF) zval_ptr_dtor(&positional_params);
+            if (limited_sql) efree(limited_sql);
+            if (clean_sql) efree(clean_sql);
+            RETURN_THROWS();
+        }
         uint8_t *req = SHM_REQ(dobj->shm_base);
         size_t off = 0;
         memcpy(req + off, &obj->proxy_tx_id, 4); off += 4;
@@ -3177,6 +3238,14 @@ PHP_METHOD(Stoolap_Transaction, executeBatch)
 
     /* Proxy path for TX executeBatch: pre-allocate once, serialize all rows */
     if (PROXY_ACTIVE(db_obj) && obj->proxy_tx_id > 0) {
+        if (!proxy_sql_fits(final_sql_len)) {
+            if (param_names) {
+                for (uint32_t i = 0; i < param_name_count; i++) zend_string_release(param_names[i]);
+                efree(param_names);
+            }
+            if (clean_sql) efree(clean_sql);
+            RETURN_THROWS();
+        }
         uint8_t *req = SHM_REQ(db_obj->shm_base);
         size_t off = 0;
         memcpy(req + off, &obj->proxy_tx_id, 4); off += 4;

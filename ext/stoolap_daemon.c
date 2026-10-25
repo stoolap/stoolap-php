@@ -756,6 +756,11 @@ static void handle_request(conn_t *c)
     uint32_t req_len   = ctl->req_len;
     uint32_t off       = 0;
 
+    if (req_len > SHM_REQ_MAX) {
+        write_error(c, "request too large for shared memory buffer");
+        return;
+    }
+
     switch (opcode) {
 
     /* OP_EXEC: [u32 sql_len][sql] → i64 affected */
@@ -1806,7 +1811,6 @@ bind_ok:
 
 /* Saved by MINIT before any fork */
 static char *g_saved_argv0 = NULL;
-static size_t g_saved_argv0_len = 0;
 static pid_t g_parent_pid = 0;
 
 void stoolap_daemon_set_parent(pid_t pid)
@@ -1814,32 +1818,12 @@ void stoolap_daemon_set_parent(pid_t pid)
     g_parent_pid = pid;
 }
 
+/* Only read for the binary name. argv is never written: the PHP CLI moves
+ * each argument into its own heap copy (ps_title), so the strings are not
+ * one contiguous block that could be cleared and reused for a title. */
 void stoolap_save_argv0(char *argv0)
 {
     g_saved_argv0 = argv0;
-    if (argv0) {
-        /* Measure full argv space: walk past all argv strings (null-separated) */
-#if defined(__APPLE__)
-        extern int *_NSGetArgc(void);
-        extern char ***_NSGetArgv(void);
-        int argc = *_NSGetArgc();
-        char **argv = *_NSGetArgv();
-        if (argc > 0 && argv) {
-            char *last = argv[argc - 1];
-            char *end = last;
-            while (*end) end++;
-            g_saved_argv0_len = end - argv0 + 1;
-        } else {
-            char *end = argv0;
-            while (*end) end++;
-            g_saved_argv0_len = end - argv0;
-        }
-#else
-        char *end = argv0;
-        while (*end) end++;
-        g_saved_argv0_len = end - argv0;
-#endif
-    }
 }
 
 void stoolap_daemon_run(char *argv0_unused, size_t argv0_unused_len)
@@ -1853,7 +1837,7 @@ void stoolap_daemon_run(char *argv0_unused, size_t argv0_unused_len)
     /* Build process title: "stoolap: <binary_name>"
      * Extract binary name from the original argv[0] before overwriting */
     char title[128];
-    if (g_saved_argv0 && g_saved_argv0_len > 0) {
+    if (g_saved_argv0) {
         /* Find binary name — take chars before first ':' or space */
         const char *bin = g_saved_argv0;
         const char *slash = strrchr(bin, '/');
@@ -1862,10 +1846,6 @@ void stoolap_daemon_run(char *argv0_unused, size_t argv0_unused_len)
         while (bin[bin_len] && bin[bin_len] != ':' && bin[bin_len] != ' ' && bin_len < 60)
             bin_len++;
         snprintf(title, sizeof(title), "stoolap: %.*s", (int)bin_len, bin);
-
-        size_t tlen = strlen(title);
-        memset(g_saved_argv0, 0, g_saved_argv0_len);
-        memcpy(g_saved_argv0, title, tlen < g_saved_argv0_len ? tlen : g_saved_argv0_len - 1);
     } else {
         snprintf(title, sizeof(title), "stoolap: php");
     }
