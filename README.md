@@ -137,6 +137,7 @@ $db = Database::open('file:///absolute/path/to/db');
 | `query($sql, $params?)` | `array` | Query rows as associative arrays |
 | `queryOne($sql, $params?)` | `?array` | Query first row or null |
 | `queryRaw($sql, $params?)` | `array` | Query in columnar format |
+| `iterate($sql, $params?)` | `Cursor` | Read rows in chunks (see [Cursors](#cursors)) |
 | `prepare($sql)` | `Statement` | Create a prepared statement |
 | `begin()` | `Transaction` | Begin a read-write transaction |
 | `beginSnapshot()` | `Transaction` | Begin a snapshot (read) transaction |
@@ -236,6 +237,21 @@ $raw = $db->queryRaw('SELECT id, name, email FROM users ORDER BY id');
 // $raw['rows']    => [[1, 'Alice', 'alice@example.com'], [2, 'Bob', 'bob@example.com']]
 ```
 
+#### Cursors
+
+`iterate()` returns a `Stoolap\Cursor` that reads the result in chunks instead of building one array for every row. Use it for large results: memory stays around 128KB at any size, while `query()` holds the whole result (about 48MB for 100,000 rows). Speed is the same as `query()`.
+
+```php
+foreach ($db->iterate('SELECT * FROM events WHERE day = $1', ['2026-10-26']) as $row) {
+    // $row is an associative array, as with query()
+}
+```
+
+- Rows arrive in chunks of 32, doubling up to 256 per engine call.
+- The cursor is forward-only and can be read once. It closes when the loop ends, on `break` or an exception, or when you call `$cursor->close()`.
+- `Database::close()` closes every open cursor of that database. `commit()`, `rollback()` and `finalize()` close the cursors of that transaction or statement. A loop over a closed cursor stops at once.
+- Also available as `$tx->iterate($sql, $params?)` and `$stmt->iterate($params?)`.
+
 ### PreparedStatement
 
 Prepared statements parse SQL once and reuse the execution plan on every call. No parsing overhead per execution.
@@ -258,6 +274,7 @@ $user = $lookup->queryOne([1]);
 | `query($params?)` | `array` | Query rows as associative arrays |
 | `queryOne($params?)` | `?array` | Query single row or null |
 | `queryRaw($params?)` | `array` | Query in columnar format |
+| `iterate($params?)` | `Cursor` | Read rows in chunks |
 | `sql()` | `string` | Get the SQL text |
 | `finalize()` | `void` | Release the prepared statement |
 
@@ -315,6 +332,7 @@ $tx->commit(); // or $tx->rollback() to undo
 | `query($sql, $params?)` | `array` | Query rows as associative arrays |
 | `queryOne($sql, $params?)` | `?array` | Query single row or null |
 | `queryRaw($sql, $params?)` | `array` | Query in columnar format |
+| `iterate($sql, $params?)` | `Cursor` | Read rows in chunks |
 | `commit()` | `void` | Commit the transaction |
 | `rollback()` | `void` | Rollback the transaction |
 
@@ -367,7 +385,7 @@ Stoolap uses exclusive file locking, so only one OS process can open a database 
 
 When loaded under php-fpm, CGI, or Apache, the extension automatically forks a background daemon process on first load. PHP workers communicate with the daemon via shared memory + futex/ulock for near-zero IPC overhead:
 
-- **Shared memory**: 8MB per connection, zero-copy request/response buffers
+- **Shared memory**: 8MB per connection (4MB request, 4MB response), zero-copy buffers
 - **futex (Linux) / __ulock (macOS)**: single-syscall wakeup, ~0.5μs bare roundtrip
 - **Spin-then-wait**: fast spin phase catches sub-microsecond responses, kernel wait for longer queries without CPU burn
 - **Auto-lifecycle**: daemon starts with php-fpm, exits when php-fpm stops
@@ -383,6 +401,14 @@ When loaded under php-fpm, CGI, or Apache, the extension automatically forks a b
 | Prepared queryOne | 1.1 μs | 1.7 μs | ~0.6 μs |
 
 Analytical queries (GROUP BY, JOIN, window functions) are unaffected since they're dominated by engine time.
+
+### Limits in Daemon Mode
+
+- SQL text and its parameters must fit in 4MB per call; larger requests throw `StoolapException` (`SQL too large for shared memory` or `params too large for shared memory`).
+- A `query()`, `queryOne()` or `queryRaw()` result must fit in 4MB. Read larger results with `iterate()`: it sizes each chunk to fit the buffer, so any result size works as long as 32 rows fit in 4MB (an average of about 128KB per row).
+- Up to 64 cursors can be open at once per connection.
+
+Direct mode (CLI) has none of these limits.
 
 ### Environment Variables
 
