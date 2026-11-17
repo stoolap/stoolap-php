@@ -8,9 +8,7 @@ permissions:
   contents: write
 
 env:
-  # Prereleases (a tag with a '-') build against engine main;
-  # set this back to the engine tag for 0.5.0.
-  STOOLAP_VERSION: main
+  STOOLAP_VERSION: v0.5.0
 
 jobs:
   build-lib:
