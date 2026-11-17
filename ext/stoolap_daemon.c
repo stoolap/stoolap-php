@@ -6,6 +6,11 @@
  * shared memory + futex/ulock IPC. Thread pool with elastic scaling.
  */
 
+/* pthread_setname_np is a GNU extension on Linux */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "stoolap_daemon.h"
 
 /* Storage for socket path (declared extern in header) */
