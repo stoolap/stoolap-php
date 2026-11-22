@@ -118,16 +118,16 @@ struct stoolap_cursor_obj {
 
 /* Object-from-zend_object macros */
 static inline stoolap_db_obj *stoolap_db_from_obj(zend_object *obj) {
-    return (stoolap_db_obj *)((char *)obj - XtOffsetOf(stoolap_db_obj, std));
+    return (stoolap_db_obj *)((char *)obj - offsetof(stoolap_db_obj, std));
 }
 static inline stoolap_stmt_obj *stoolap_stmt_from_obj(zend_object *obj) {
-    return (stoolap_stmt_obj *)((char *)obj - XtOffsetOf(stoolap_stmt_obj, std));
+    return (stoolap_stmt_obj *)((char *)obj - offsetof(stoolap_stmt_obj, std));
 }
 static inline stoolap_tx_obj *stoolap_tx_from_obj(zend_object *obj) {
-    return (stoolap_tx_obj *)((char *)obj - XtOffsetOf(stoolap_tx_obj, std));
+    return (stoolap_tx_obj *)((char *)obj - offsetof(stoolap_tx_obj, std));
 }
 static inline stoolap_cursor_obj *stoolap_cursor_from_obj(zend_object *obj) {
-    return (stoolap_cursor_obj *)((char *)obj - XtOffsetOf(stoolap_cursor_obj, std));
+    return (stoolap_cursor_obj *)((char *)obj - offsetof(stoolap_cursor_obj, std));
 }
 
 #define Z_STOOLAP_DB_P(zv) stoolap_db_from_obj(Z_OBJ_P(zv))
@@ -4093,7 +4093,7 @@ PHP_MINIT_FUNCTION(stoolap)
     stoolap_database_ce->create_object = stoolap_db_create;
 
     memcpy(&stoolap_database_handlers, &std_object_handlers, sizeof(zend_object_handlers));
-    stoolap_database_handlers.offset = XtOffsetOf(stoolap_db_obj, std);
+    stoolap_database_handlers.offset = offsetof(stoolap_db_obj, std);
     stoolap_database_handlers.free_obj = stoolap_db_free;
     stoolap_database_handlers.clone_obj = NULL;
 
@@ -4104,7 +4104,7 @@ PHP_MINIT_FUNCTION(stoolap)
     stoolap_statement_ce->create_object = stoolap_stmt_create;
 
     memcpy(&stoolap_statement_handlers, &std_object_handlers, sizeof(zend_object_handlers));
-    stoolap_statement_handlers.offset = XtOffsetOf(stoolap_stmt_obj, std);
+    stoolap_statement_handlers.offset = offsetof(stoolap_stmt_obj, std);
     stoolap_statement_handlers.free_obj = stoolap_stmt_free;
     stoolap_statement_handlers.clone_obj = NULL;
 
@@ -4115,7 +4115,7 @@ PHP_MINIT_FUNCTION(stoolap)
     stoolap_transaction_ce->create_object = stoolap_tx_create;
 
     memcpy(&stoolap_transaction_handlers, &std_object_handlers, sizeof(zend_object_handlers));
-    stoolap_transaction_handlers.offset = XtOffsetOf(stoolap_tx_obj, std);
+    stoolap_transaction_handlers.offset = offsetof(stoolap_tx_obj, std);
     stoolap_transaction_handlers.free_obj = stoolap_tx_free;
     stoolap_transaction_handlers.clone_obj = NULL;
 
@@ -4128,7 +4128,7 @@ PHP_MINIT_FUNCTION(stoolap)
     zend_class_implements(stoolap_cursor_ce, 1, zend_ce_aggregate);
 
     memcpy(&stoolap_cursor_handlers, &std_object_handlers, sizeof(zend_object_handlers));
-    stoolap_cursor_handlers.offset = XtOffsetOf(stoolap_cursor_obj, std);
+    stoolap_cursor_handlers.offset = offsetof(stoolap_cursor_obj, std);
     stoolap_cursor_handlers.free_obj = stoolap_cursor_free;
     stoolap_cursor_handlers.clone_obj = NULL;
 
